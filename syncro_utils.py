@@ -18,6 +18,14 @@ import pytz  # Make sure to install pytz if not already installed
 from syncro_configs import SYNCRO_TIMEZONE
 _temp_data_cache = None  # Global cache for temp data
 
+# Establish a session for Syncro API interactions with default headers
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {SYNCRO_API_KEY}",
+    "accept": "application/json",
+    "Content-Type": "application/json",
+})
+
 
 def load_or_fetch_temp_data(logger: logging.Logger, force_refresh: bool = False) -> dict:
     """
@@ -158,15 +166,12 @@ def syncro_api_call(method: str, endpoint: str, data: dict = None, params: dict 
     from syncro_read import increment_api_call_count
     increment_api_call_count()
     url = f"{SYNCRO_API_BASE_URL}{endpoint}"
-    headers = {
-        "Authorization": f"Bearer {SYNCRO_API_KEY}",
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    }
 
     try:
+
         response = requests.request(method, url, headers=headers, json=data, params=params)
         time.sleep(RATE_LIMIT_SECONDS)
+
         response.raise_for_status()  # Raise HTTPError for bad responses
         return response.json() if response.content else {}
     except requests.HTTPError as http_err:

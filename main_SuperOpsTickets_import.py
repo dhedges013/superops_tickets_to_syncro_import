@@ -31,6 +31,10 @@ HEADERS = {
     "Customersubdomain": CUSTOMER_SUBDOMAIN
 }
 
+# Reuse a single session for all API interactions with default headers
+session = requests.Session()
+session.headers.update(HEADERS)
+
 # GraphQL Queries
 QUERY_GET_CLIENT_LIST = """query getClientList($input: ListInfoInput!) { getClientList(input: $input) { clients { accountId name }}}"""
 QUERY_GET_TICKETS = """query getTicketList($input: ListInfoInput!) { getTicketList(input: $input) { tickets { ticketId displayId subject status priority createdTime } listInfo { hasMore totalCount }}}"""
@@ -39,12 +43,14 @@ QUERY_GET_TICKET_NOTES = """query getTicketNoteList($input: TicketIdentifierInpu
 
 # Function to make API calls
 def make_api_call(query, variables=None):
+
     time.sleep(RATE_LIMIT_SECONDS)
+
     """Generic function to make GraphQL requests to SuperOps API"""
     payload = {"query": query, "variables": variables or {}}
 
     try:
-        response = requests.post(BASE_URL, headers=HEADERS, json=payload)
+        response = session.request("POST", BASE_URL, json=payload)
         response.raise_for_status()
         return response.json()
 
