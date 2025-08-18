@@ -2,7 +2,7 @@ import requests
 import time
 from pprint import pprint
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
-from syncro_configs import get_logger  # Import logger function
+from syncro_configs import get_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
@@ -43,7 +43,9 @@ QUERY_GET_TICKET_NOTES = """query getTicketNoteList($input: TicketIdentifierInpu
 
 # Function to make API calls
 def make_api_call(query, variables=None):
-    time.sleep(.35)
+
+    time.sleep(RATE_LIMIT_SECONDS)
+
     """Generic function to make GraphQL requests to SuperOps API"""
     payload = {"query": query, "variables": variables or {}}
 
@@ -58,7 +60,12 @@ def make_api_call(query, variables=None):
 
 # Function to strip HTML content
 def strip_html(content):
-    """Strips HTML tags and returns plain text."""
+    """Strips HTML tags and returns plain text.
+
+    Returns an empty string when content is missing.
+    """
+    if not content:
+        return ""
     soup = BeautifulSoup(content, "html.parser")
     return soup.get_text()
 

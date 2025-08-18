@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Any, Dict, List
 import csv
-from syncro_configs import SYNCRO_API_BASE_URL, SYNCRO_API_KEY, get_logger, TEMP_FILE_PATH
+from syncro_configs import SYNCRO_API_BASE_URL, SYNCRO_API_KEY, get_logger, TEMP_FILE_PATH, RATE_LIMIT_SECONDS
 
 import logging
 import re
@@ -168,8 +168,10 @@ def syncro_api_call(method: str, endpoint: str, data: dict = None, params: dict 
     url = f"{SYNCRO_API_BASE_URL}{endpoint}"
 
     try:
-        response = session.request(method, url, json=data, params=params)
-        time.sleep(0.5)
+
+        response = requests.request(method, url, headers=headers, json=data, params=params)
+        time.sleep(RATE_LIMIT_SECONDS)
+
         response.raise_for_status()  # Raise HTTPError for bad responses
         return response.json() if response.content else {}
     except requests.HTTPError as http_err:
