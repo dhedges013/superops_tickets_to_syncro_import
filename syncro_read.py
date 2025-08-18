@@ -16,7 +16,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, parent_dir)
 
 # Import from syncro_config and utils
-from syncro_configs import SYNCRO_API_BASE_URL, SYNCRO_API_KEY, get_logger
+from syncro_configs import SYNCRO_API_BASE_URL, SYNCRO_API_KEY, get_logger, RATE_LIMIT_SECONDS
 from syncro_utils import syncro_api_call
 
 # Get a logger for this module
@@ -58,7 +58,7 @@ def syncro_api_get(endpoint: str, params: dict = None):
         params["page"] = current_page
 
         response = syncro_api_call("GET", endpoint, params=params)
-        time.sleep(0.5)
+        time.sleep(RATE_LIMIT_SECONDS)
         if not response:
             logger.error(f"Failed to fetch data from {endpoint}. Stopping pagination.")
             break
