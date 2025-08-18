@@ -13,8 +13,8 @@ sys.path.insert(0, parent_dir)
 
 # Get a logger for this module
 logger = get_logger(__name__)
-print(f"Handlers for {logger.name}: {logger.handlers}")
-print(f"Handlers for root logger: {logging.getLogger().handlers}")
+logger.debug(f"Handlers for {logger.name}: {logger.handlers}")
+logger.debug(f"Handlers for root logger: {logging.getLogger().handlers}")
 
 def syncro_create_customer(customer_data: dict):
     """
