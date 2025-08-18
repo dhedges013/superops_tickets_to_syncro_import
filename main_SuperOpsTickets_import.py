@@ -7,7 +7,6 @@ from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_an
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
 from syncro_write import syncro_create_ticket, syncro_create_comment
-from datetime import datetime
 
 #change to pauser_on to "yes" to have the import wait for each ticket and/or comment to review
 #pauser_on = "yes"
@@ -16,8 +15,7 @@ pauser_on = None
 # Initialize Logger
 logger = get_logger(__name__)
 
-# Define the cutoff date
-cutoff_date = datetime(2024, 4, 1)
+
 
 # API Configuration
 API_KEY = "Your SuperOps API Key"
@@ -499,18 +497,7 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
             logger.info(f"❌ Customer {client} Ticket {ticket_id} ({subject}) NOT found in Syncro.")
             new_syncro_ticket = syncro_prepare_ticket_json_superops(client, contact,ticket_id, subject, converted_created_time, status, priority, assigned_tech, description, timeline)
             logger.info(f"Attempting to create Ticket: {new_syncro_ticket}")
-
-            
-            # Convert created_at string to datetime object
-            ticket_created_time = datetime.strptime(new_syncro_ticket['created_at'], "%Y-%m-%dT%H:%M:%S%z")
-
-            # Check if the ticket is older than April 2024
-            if ticket_created_time < cutoff_date.replace(tzinfo=ticket_created_time.tzinfo):
-                logger.info(f"Skipping ticket creation: Ticket {ticket_id} ({subject}) is too old (Created: {new_syncro_ticket['created_at']}) compared to cutoff date {cutoff_date}.")
-                #input("Press Enter to continue...")
-            else:
-                logger.info(f"Attempting to create Ticket: {new_syncro_ticket}")
-                created_ticket_response = syncro_create_ticket(new_syncro_ticket)
+            created_ticket_response = syncro_create_ticket(new_syncro_ticket)
                 
             
 

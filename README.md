@@ -6,11 +6,10 @@
    - Add your **Syncro Subdomain** and **API Key** in the `syncro_configs` file.
    - Adjust your Timezone if needed
 
-1b. **Configure SuperOps API Access**  
+1b. **Configure SuperOps API Access**
     - the fields are API_KEY and CUSTOMER_SUBDOMAIN located at the top of main_SuperOpsTickets_import.py file
 
-
-2. **Import Process & Temporary Data**  
+2. **Import Process & Temporary Data**
    - To speed up the import process, the importer generates a `syncro_temp_data.json` file on the first run of `main_tickets.py`.  
    - If you add new **Techs, Customers, Contacts, Ticket Issue Types, Statuses, etc.**, you **must delete this file** to allow the importer to rebuild it on the next run.
 
