@@ -93,7 +93,7 @@ def get_assigned_tech_and_user(conversations):
         tech_replies = [conv for conv in conversations if conv.get('type') == 'TECH_REPLY']
 
         if tech_replies:
-            oldest_tech_reply = max(tech_replies, key=lambda x: x['time'])  # Find oldest TECH_REPLY
+            oldest_tech_reply = min(tech_replies, key=lambda x: x['time'])  # Find oldest TECH_REPLY
             tech = oldest_tech_reply.get('user', None)  # Get the technician's info
             to_users = oldest_tech_reply.get("toUsers", [])  # Get the toUsers list
             
