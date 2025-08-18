@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
 from syncro_configs import get_logger  # Import logger function
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date
-from syncro_configs import get_logger  # Centralized logger import
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
 from syncro_write import syncro_create_ticket, syncro_create_comment
 from datetime import datetime
