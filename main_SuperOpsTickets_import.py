@@ -54,7 +54,12 @@ def make_api_call(query, variables=None):
 
 # Function to strip HTML content
 def strip_html(content):
-    """Strips HTML tags and returns plain text."""
+    """Strips HTML tags and returns plain text.
+
+    Returns an empty string when content is missing.
+    """
+    if not content:
+        return ""
     soup = BeautifulSoup(content, "html.parser")
     return soup.get_text()
 
