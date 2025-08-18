@@ -14,6 +14,9 @@ SYNCRO_API_KEY = "your_api_key"
 
 SYNCRO_API_BASE_URL = f"https://{SYNCRO_SUBDOMAIN}.syncromsp.com/api/v1"
 
+# Rate limiting configuration
+RATE_LIMIT_SECONDS = 0.5
+
 # Logging Configuration
 LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
