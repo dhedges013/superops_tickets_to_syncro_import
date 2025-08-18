@@ -21,8 +21,8 @@ from syncro_utils import syncro_api_call
 
 # Get a logger for this module
 logger = get_logger(__name__)
-print(f"Handlers for {logger.name}: {logger.handlers}")
-print(f"Handlers for root logger: {logging.getLogger().handlers}")
+logger.debug(f"Handlers for {logger.name}: {logger.handlers}")
+logger.debug(f"Handlers for root logger: {logging.getLogger().handlers}")
 
 _api_call_count = 0
 
