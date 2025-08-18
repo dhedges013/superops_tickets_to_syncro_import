@@ -6,8 +6,11 @@
    - Add your **Syncro Subdomain** and **API Key** in the `syncro_configs` file.
    - Adjust your Timezone if needed
 
-1b. **Configure SuperOps API Access**  
+1b. **Configure SuperOps API Access**
     - the fields are API_KEY and CUSTOMER_SUBDOMAIN located at the top of main_SuperOpsTickets_import.py file
+
+1c. **Configure Import Options**
+   - In `syncro_configs.py`, set `CREATE_MISSING_CUSTOMERS = True` to automatically create a Syncro customer when none is found.
 
 
 2. **Import Process & Temporary Data**  

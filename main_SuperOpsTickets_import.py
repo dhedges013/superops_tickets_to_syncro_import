@@ -2,11 +2,11 @@ import requests
 import time
 from pprint import pprint
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
-from syncro_configs import get_logger  # Import logger function
+from syncro_configs import get_logger, CREATE_MISSING_CUSTOMERS  # Import logger function and configs
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
-from syncro_utils import get_customer_id_by_name, get_syncro_created_date
+from syncro_utils import get_customer_id_by_name, get_syncro_created_date, load_or_fetch_temp_data
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
-from syncro_write import syncro_create_ticket, syncro_create_comment
+from syncro_write import syncro_create_ticket, syncro_create_comment, syncro_create_customer
 from datetime import datetime
 
 #change to pauser_on to "yes" to have the import wait for each ticket and/or comment to review
@@ -431,8 +431,17 @@ def process_customer_tickets(client, tickets):
 
         syncro_customer_id = get_customer_id_by_name(client)
         if not syncro_customer_id:
-            logger.warning(f"⚠️ Customer '{client}' not found in Syncro. Skipping.")
-            return
+            if CREATE_MISSING_CUSTOMERS:
+                logger.info(f"Customer '{client}' not found. Creating new customer in Syncro.")
+                syncro_create_customer({"business_name": client})
+                load_or_fetch_temp_data(logger, force_refresh=True)
+                syncro_customer_id = get_customer_id_by_name(client)
+                if not syncro_customer_id:
+                    logger.error(f"Failed to create customer '{client}'. Skipping.")
+                    return
+            else:
+                logger.warning(f"⚠️ Customer '{client}' not found in Syncro. Skipping.")
+                return
 
         syncro_tickets = get_all_tickets_for_customer(client)
         syncro_tickets_subjects_dates = extract_ticket_subjects_and_dates(syncro_tickets)
