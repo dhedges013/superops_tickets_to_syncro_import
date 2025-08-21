@@ -472,7 +472,8 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
             return
 
         converted_created_time = get_syncro_created_date(created_time)
-        status = ticket_info.get("status", "Unknown")
+        # Force imported tickets to have a Resolved status in Syncro
+        status = "Resolved"
         priority = ticket_info.get("priority", "Unknown")
         assigned_tech = extract_assigned_tech(ticket_id, ticket_info)
         description = ticket_info.get("description", "No description available.")
