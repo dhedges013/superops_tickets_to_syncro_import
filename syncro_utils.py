@@ -169,7 +169,7 @@ def syncro_api_call(method: str, endpoint: str, data: dict = None, params: dict 
 
     try:
 
-        response = requests.request(method, url, headers=headers, json=data, params=params)
+       response = session.request(method, url, json=data, params=params)
         time.sleep(RATE_LIMIT_SECONDS)
 
         response.raise_for_status()  # Raise HTTPError for bad responses
