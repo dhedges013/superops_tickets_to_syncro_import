@@ -444,13 +444,14 @@ def get_syncro_tech(tech_name: str):
 
 
 
-def build_syncro_initial_issue(initial_issue: str, syncroContact: str) -> list:
+def build_syncro_initial_issue(initial_issue: str, syncroContact: str, created_at: str) -> list:
     """
     Build the JSON object for the initial issue in Syncro.
 
     Args:
         initial_issue (str): The issue description.
         syncroContact (str): The Syncro contact associated with the issue.
+        created_at (str): Timestamp for the initial issue comment.
 
     Returns:
         list: A list representing the comments for the initial issue.
@@ -489,7 +490,8 @@ def build_syncro_initial_issue(initial_issue: str, syncroContact: str) -> list:
                 "body": initial_issue,
                 "hidden": True,
                 "do_not_email": True,
-                "tech": syncroContact
+                "tech": syncroContact,
+                "created_at": created_at
             }
         ]
 
@@ -947,7 +949,7 @@ def syncro_prepare_ticket_json_superops(client, contact, ticket_id, subject, con
     syncro_tech = get_syncro_tech(tech)
     syncro_created_date = get_syncro_created_date(created)
     syncro_contact = get_syncro_customer_contact(customer_id, contact)
-    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact)    
+    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact, syncro_created_date)
     syncro_priority = get_syncro_priority(priority)
 
     # Create JSON payload
@@ -997,7 +999,7 @@ def syncro_prepare_ticket_json(ticket):
     syncro_tech = get_syncro_tech(tech)
     syncro_created_date = get_syncro_created_date(created)
     syncro_contact = get_syncro_customer_contact(customer_id, contact)
-    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact)
+    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact, syncro_created_date)
     syncro_issue_type = get_syncro_issue_type(issue_type)
     syncro_priority = get_syncro_priority(priority)
 
