@@ -247,38 +247,6 @@ def combine_notes_and_conversations(notes, conversations):
     
     return merged_items if merged_items else ["No notes or conversations found."]
 
-# Fetch all clients and their tickets
-def get_all_clients_with_tickets():
-    """Fetch all clients and their tickets"""
-    clients = make_api_call(QUERY_GET_CLIENT_LIST, {"input": {"page": 1, "pageSize": 100}})
-    #logger.info(f"Total clients in SuperOpsfound: {len(clients)}")
-
-    if clients is None or "data" not in clients or clients["data"].get("getClientList") is None:
-        return {}
-
-    client_tickets = {}
-    #logger.info(f"Total client Tickets found: {len(client_tickets)}")
-    for client in clients["data"]["getClientList"]["clients"]:
-        account_id = client["accountId"]
-        client_name = client["name"]
-
-        tickets = get_tickets_for_client(account_id)
-        logger.info(f"Tickets found for {client_name}: {len(tickets)}")
-
-        # Structure tickets
-        client_ticket_info = {}
-        for ticket in tickets:
-            ticket_id = ticket.get("ticketId")
-            if ticket_id:
-                ticket_info = extract_ticket_details({"ticketData": ticket})
-                ticket_info["assigned_tech"],ticket_info["contact"] = get_assigned_tech_and_user(ticket_info["conversations"])
-                ticket_info["description"] = get_description_content(ticket_info["conversations"])
-
-                client_ticket_info[ticket_id] = ticket_info
-
-        client_tickets[client_name] = client_ticket_info
-
-    return client_tickets
 
 
 def compare_tickets_by_subject_and_date(superops_tickets, syncro_tickets):
@@ -404,22 +372,42 @@ def compare_tickets_by_subject(superops_tickets, syncro_tickets):
 
     return matched_tickets
 
-def process_tickets(customers_tickets):
-    """
-    Process and display tickets with extracted details.
 
-    Args:
-        customers_tickets (dict): Dictionary containing customer names as keys and their tickets as values.
-    """
-    try:
-        logger.info(f"Processing tickets for {len(customers_tickets)} customers.")
+def process_all_clients():
+    """Fetch clients and process their tickets one customer at a time."""
+    clients_response = make_api_call(
+        QUERY_GET_CLIENT_LIST, {"input": {"page": 1, "pageSize": 100}}
+    )
 
-        for client, tickets in customers_tickets.items():
-            process_customer_tickets(client, tickets)
+    if (
+        clients_response is None
+        or "data" not in clients_response
+        or clients_response["data"].get("getClientList") is None
+    ):
+        return
 
-    except Exception as e:
-        logger.critical(f"🔥 Critical error processing all tickets: {e}", exc_info=True)
+    for client in clients_response["data"]["getClientList"]["clients"]:
+        account_id = client["accountId"]
+        client_name = client["name"]
 
+        tickets = get_tickets_for_client(account_id)
+        logger.info(f"Tickets found for {client_name}: {len(tickets)}")
+
+        client_ticket_info = {}
+        for ticket in tickets:
+            ticket_id = ticket.get("ticketId")
+            if ticket_id:
+                ticket_info = extract_ticket_details({"ticketData": ticket})
+                ticket_info["assigned_tech"], ticket_info["contact"] = get_assigned_tech_and_user(
+                    ticket_info["conversations"]
+                )
+                ticket_info["description"] = get_description_content(
+                    ticket_info["conversations"]
+                )
+
+                client_ticket_info[ticket_id] = ticket_info
+
+        process_customer_tickets(client_name, client_ticket_info)
 
 def process_customer_tickets(client, tickets):
     """
@@ -599,5 +587,4 @@ def extract_notes_and_conversations(ticket_id, ticket_info):
 
 # Main Execution
 if __name__ == "__main__":
-    customers_tickets = get_all_clients_with_tickets()
-    process_tickets(customers_tickets)
+    process_all_clients()
