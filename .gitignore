@@ -1,1 +1,9 @@
 /logs/*
+local_config.py
+syncro_temp_data.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/

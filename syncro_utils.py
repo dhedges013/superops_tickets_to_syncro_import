@@ -168,8 +168,7 @@ def syncro_api_call(method: str, endpoint: str, data: dict = None, params: dict 
     url = f"{SYNCRO_API_BASE_URL}{endpoint}"
 
     try:
-
-       response = session.request(method, url, json=data, params=params)
+        response = session.request(method, url, json=data, params=params)
         time.sleep(RATE_LIMIT_SECONDS)
 
         response.raise_for_status()  # Raise HTTPError for bad responses
@@ -384,6 +383,46 @@ def get_syncro_ticket_number(ticketNumber: str) -> str:
         logger.error(f"Error processing ticket number '{ticketNumber}': {e}")
         raise
 
+
+def get_next_available_syncro_ticket_number(preferred_number: str, max_attempts: int = 10000) -> str:
+    """
+    Try to use the preferred ticket number first, then increment until a free Syncro ticket number is found.
+    """
+    from syncro_read import get_syncro_ticket_by_number
+
+    cleaned_ticket_number = get_syncro_ticket_number(str(preferred_number))
+    if not cleaned_ticket_number:
+        logger.warning("Preferred ticket number '%s' produced no numeric value.", preferred_number)
+        return None
+
+    candidate_number = int(cleaned_ticket_number)
+    attempts = 0
+
+    while attempts < max_attempts:
+        candidate_str = str(candidate_number)
+        existing_ticket = get_syncro_ticket_by_number(candidate_str)
+        if existing_ticket is None:
+            logger.info(
+                "Selected Syncro ticket number '%s' using preferred source number '%s'.",
+                candidate_str,
+                preferred_number,
+            )
+            return candidate_str
+
+        logger.warning(
+            "Syncro ticket number '%s' is already taken. Trying next number.",
+            candidate_str,
+        )
+        candidate_number += 1
+        attempts += 1
+
+    logger.error(
+        "Failed to find an available Syncro ticket number after %s attempts starting from '%s'.",
+        max_attempts,
+        cleaned_ticket_number,
+    )
+    return None
+
 def get_syncro_tech(tech_name: str):
     """
     Get the ID of a technician by name (case-insensitive).
@@ -531,7 +570,6 @@ def build_syncro_comment(comment: dict) -> dict:
     """
     logger.debug(f"Calling build_syncro_comment in syncro_utils.py")
     logger.debug(f"Raw comment data received: {comment}")
-    input("Waiting: ")
     try:
         logger.debug(f"Raw comment data received: {comment}")
 
@@ -834,6 +872,82 @@ def get_syncro_issue_type(issue_type: str):
         logger.error(f"Error occurred while matching issue type '{issue_type}': {e}")
         return None
 
+
+def get_syncro_status(status: str, default_status: str = "Resolved"):
+    """
+    Map a source status string to the closest available Syncro ticket status.
+
+    Mapping order:
+    1. Exact case-insensitive match against Syncro statuses
+    2. Known fallback synonyms
+    3. Default status if available
+    4. Original default string as a final fallback
+    """
+    try:
+        temp_data = load_or_fetch_temp_data(logger, force_refresh=False)
+        statuses = temp_data.get("statuses", [])
+
+        if not statuses:
+            logger.warning("No Syncro statuses found. Falling back to default status '%s'.", default_status)
+            return default_status
+
+        normalized_statuses = {}
+        for entry in statuses:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+            else:
+                name = entry
+
+            if isinstance(name, str) and name.strip():
+                normalized_statuses[name.strip().lower()] = name
+
+        if not normalized_statuses:
+            logger.warning("Syncro statuses were present but unusable. Falling back to default status '%s'.", default_status)
+            return default_status
+
+        if status and isinstance(status, str):
+            normalized_input = status.strip().lower()
+            exact_match = normalized_statuses.get(normalized_input)
+            if exact_match:
+                logger.info("Status '%s' mapped to Syncro status '%s' by exact match.", status, exact_match)
+                return exact_match
+
+            fallback_map = {
+                "new": ["new", "open"],
+                "open": ["open", "new"],
+                "in progress": ["in progress", "open"],
+                "pending": ["pending", "waiting on customer", "open"],
+                "waiting on customer": ["waiting on customer", "pending", "open"],
+                "resolved": ["resolved", "closed", "complete", "completed"],
+                "closed": ["closed", "resolved", "complete", "completed"],
+                "complete": ["complete", "completed", "resolved", "closed"],
+                "completed": ["completed", "complete", "resolved", "closed"],
+            }
+
+            for candidate in fallback_map.get(normalized_input, []):
+                mapped = normalized_statuses.get(candidate)
+                if mapped:
+                    logger.info("Status '%s' mapped to Syncro status '%s' by fallback.", status, mapped)
+                    return mapped
+
+        default_match = normalized_statuses.get(default_status.strip().lower())
+        if default_match:
+            logger.info("Status '%s' fell back to default Syncro status '%s'.", status, default_match)
+            return default_match
+
+        first_status = next(iter(normalized_statuses.values()))
+        logger.warning(
+            "Status '%s' could not be mapped and default '%s' was unavailable. Falling back to first Syncro status '%s'.",
+            status,
+            default_status,
+            first_status,
+        )
+        return first_status
+
+    except Exception as e:
+        logger.error("Error occurred while matching status '%s': %s", status, e)
+        return default_status
+
 def syncro_get_all_tickets_from_csv(logger: logging.Logger = None) -> List[Dict[str, Any]]:
     """
     Load all tickets from a CSV file.
@@ -930,7 +1044,7 @@ def syncro_get_all_comments_from_csv(logger: logging.Logger = None) -> List[Dict
 
 
 
-def syncro_prepare_ticket_json_superops(client, contact, ticket_id, subject, converted_created_time, status, priority, assigned_tech, description, timeline):
+def syncro_prepare_ticket_json_superops(client, contact, source_display_id, subject, converted_created_time, status, priority, assigned_tech, description, timeline):
     """
     Extract ticket data into variables and create a JSON package for Syncro ticket creation.
     """
@@ -946,6 +1060,7 @@ def syncro_prepare_ticket_json_superops(client, contact, ticket_id, subject, con
 
     # Process fields
     customer_id = get_customer_id_by_name(customer)    
+    syncro_ticket_number = get_next_available_syncro_ticket_number(source_display_id)
     syncro_tech = get_syncro_tech(tech)
     syncro_created_date = get_syncro_created_date(created)
     syncro_contact = get_syncro_customer_contact(customer_id, contact)
@@ -954,7 +1069,7 @@ def syncro_prepare_ticket_json_superops(client, contact, ticket_id, subject, con
 
     # Create JSON payload
     ticket_json = {
-        "ticket_number": None,
+        "number": syncro_ticket_number,
         "customer_id": customer_id,        
         "subject": subject,
         "user_id": syncro_tech,

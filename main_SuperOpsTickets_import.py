@@ -1,10 +1,9 @@
 import requests
 import time
-from pprint import pprint
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
 from syncro_configs import get_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
-from syncro_utils import get_customer_id_by_name, get_syncro_created_date
+from syncro_utils import get_customer_id_by_name, get_syncro_created_date, get_syncro_status
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
 from syncro_write import syncro_create_ticket, syncro_create_comment
 
@@ -18,9 +17,65 @@ logger = get_logger(__name__)
 
 
 # API Configuration
-API_KEY = "Your SuperOps API Key"
-BASE_URL = "https://api.superops.ai/msp"
-CUSTOMER_SUBDOMAIN = "Your superops_subdomain"
+# API_KEY = "Your SuperOps API Key"
+# BASE_URL = "https://api.superops.ai/msp"
+# CUSTOMER_SUBDOMAIN = "Your superops_subdomain"
+DEFAULT_API_KEY = "Your SuperOps API Key"
+DEFAULT_BASE_URL = "https://api.superops.ai/msp"
+DEFAULT_CUSTOMER_SUBDOMAIN = "Your superops_subdomain"
+DEFAULT_DRY_RUN = False
+DEFAULT_MAX_TICKETS_TO_IMPORT = None
+API_KEY = DEFAULT_API_KEY
+BASE_URL = DEFAULT_BASE_URL
+CUSTOMER_SUBDOMAIN = DEFAULT_CUSTOMER_SUBDOMAIN
+DRY_RUN = DEFAULT_DRY_RUN
+MAX_TICKETS_TO_IMPORT = DEFAULT_MAX_TICKETS_TO_IMPORT
+
+try:
+    from local_config import SUPEROPS_API_KEY as LOCAL_SUPEROPS_API_KEY
+    from local_config import SUPEROPS_BASE_URL as LOCAL_SUPEROPS_BASE_URL
+    from local_config import SUPEROPS_CUSTOMER_SUBDOMAIN as LOCAL_SUPEROPS_CUSTOMER_SUBDOMAIN
+
+    API_KEY = LOCAL_SUPEROPS_API_KEY
+    BASE_URL = LOCAL_SUPEROPS_BASE_URL
+    CUSTOMER_SUBDOMAIN = LOCAL_SUPEROPS_CUSTOMER_SUBDOMAIN
+except ImportError:
+    pass
+
+try:
+    from local_config import DRY_RUN as LOCAL_DRY_RUN
+
+    DRY_RUN = LOCAL_DRY_RUN
+except ImportError:
+    pass
+
+try:
+    from local_config import MAX_TICKETS_TO_IMPORT as LOCAL_MAX_TICKETS_TO_IMPORT
+
+    MAX_TICKETS_TO_IMPORT = LOCAL_MAX_TICKETS_TO_IMPORT
+except ImportError:
+    pass
+
+
+def normalize_ticket_cap(ticket_cap):
+    """Normalize an optional ticket cap into a positive integer or None."""
+    if ticket_cap in (None, "", 0):
+        return None
+
+    try:
+        normalized_cap = int(ticket_cap)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid MAX_TICKETS_TO_IMPORT value: %r", ticket_cap)
+        return None
+
+    if normalized_cap <= 0:
+        logger.warning("Ignoring non-positive MAX_TICKETS_TO_IMPORT value: %r", ticket_cap)
+        return None
+
+    return normalized_cap
+
+
+MAX_TICKETS_TO_IMPORT = normalize_ticket_cap(MAX_TICKETS_TO_IMPORT)
 
 # Headers
 HEADERS = {
@@ -126,6 +181,54 @@ def get_description_content(conversations):
 
     return None  # No DESCRIPTION found
 
+
+def extract_contact_name(to_users):
+    """Normalize SuperOps toUsers data into a single contact name string."""
+    if not to_users:
+        return None
+
+    first_user = to_users[0]
+    if isinstance(first_user, dict):
+        user_value = first_user.get("user")
+        if isinstance(user_value, dict):
+            return user_value.get("name")
+        if isinstance(user_value, str):
+            return user_value
+        return first_user.get("name")
+
+    if isinstance(first_user, str):
+        return first_user
+
+    return None
+
+
+def normalize_superops_ticket(ticket):
+    """Convert raw SuperOps ticket data into a stable internal shape."""
+    ticket_info = extract_ticket_details({"ticketData": ticket})
+    assigned_tech, to_users = get_assigned_tech_and_user(ticket_info["conversations"])
+
+    assigned_tech_name = None
+    if isinstance(assigned_tech, dict):
+        assigned_tech_name = assigned_tech.get("name")
+    elif isinstance(assigned_tech, str):
+        assigned_tech_name = assigned_tech
+
+    normalized_ticket = {
+        "displayId": ticket_info.get("displayId"),
+        "ticketId": ticket_info.get("ticketId"),
+        "subject": ticket_info.get("subject"),
+        "status": ticket_info.get("status"),
+        "priority": ticket_info.get("priority"),
+        "created_time": ticket_info.get("created_time"),
+        "notes": ticket_info.get("notes", []),
+        "conversations": ticket_info.get("conversations", []),
+        "assigned_tech": assigned_tech_name,
+        "contact": extract_contact_name(to_users),
+        "description": get_description_content(ticket_info["conversations"]),
+    }
+
+    return normalized_ticket
+
 # Fetch ticket conversations
 def get_ticket_conversations(ticket_id):
     """Fetches all conversations for a given ticket ID."""
@@ -160,12 +263,21 @@ def get_ticket_notes(ticket_id):
     return notes
 
 # Fetch all tickets for a client
-def get_tickets_for_client(account_id):
+def get_tickets_for_client(account_id, remaining_ticket_cap=None):
     """Fetches all tickets for a given client using `condition` filter."""
     tickets = []
     page = 1
     page_size = 10
-    logger.info(f"Getting tickets for client {account_id}")
+    logger.info(
+        "Getting tickets for client %s remaining_ticket_cap=%s",
+        account_id,
+        remaining_ticket_cap,
+    )
+
+    if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
+        logger.info("Skipping ticket fetch for client %s because the ticket cap was reached.", account_id)
+        return tickets
+
     while True:
         variables = {
             "input": {
@@ -189,6 +301,14 @@ def get_tickets_for_client(account_id):
 
         logger.info(f"Tickets for client {account_id}: {len(ticket_data['tickets'])}")
         for ticket in ticket_data["tickets"]:
+            if remaining_ticket_cap is not None and len(tickets) >= remaining_ticket_cap:
+                logger.info(
+                    "Reached remaining ticket cap for client %s at %s tickets.",
+                    account_id,
+                    remaining_ticket_cap,
+                )
+                return tickets
+
             ticket_id = ticket.get("ticketId")
             if not ticket_id:
                 continue
@@ -371,44 +491,6 @@ def compare_tickets_by_subject(superops_tickets, syncro_tickets):
         logger.exception(f"Critical error in compare_tickets_by_subject: {e}")
 
     return matched_tickets
-
-
-def process_all_clients():
-    """Fetch clients and process their tickets one customer at a time."""
-    clients_response = make_api_call(
-        QUERY_GET_CLIENT_LIST, {"input": {"page": 1, "pageSize": 100}}
-    )
-
-    if (
-        clients_response is None
-        or "data" not in clients_response
-        or clients_response["data"].get("getClientList") is None
-    ):
-        return
-
-    for client in clients_response["data"]["getClientList"]["clients"]:
-        account_id = client["accountId"]
-        client_name = client["name"]
-
-        tickets = get_tickets_for_client(account_id)
-        logger.info(f"Tickets found for {client_name}: {len(tickets)}")
-
-        client_ticket_info = {}
-        for ticket in tickets:
-            ticket_id = ticket.get("ticketId")
-            if ticket_id:
-                ticket_info = extract_ticket_details({"ticketData": ticket})
-                ticket_info["assigned_tech"], ticket_info["contact"] = get_assigned_tech_and_user(
-                    ticket_info["conversations"]
-                )
-                ticket_info["description"] = get_description_content(
-                    ticket_info["conversations"]
-                )
-
-                client_ticket_info[ticket_id] = ticket_info
-
-        process_customer_tickets(client_name, client_ticket_info)
-
 def process_customer_tickets(client, tickets):
     """
     Process tickets for a specific customer.
@@ -516,9 +598,6 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
                         continue  # Skip DESCRIPTION type entries
 
                     logger.info(f"from process_individual_ticket - Now forming comment for ticket {created_ticket_number}: {entry}")
-                    pprint(f"from process_individual_ticket - Now forming comment for ticket {created_ticket_number}: {entry}")
-                    print(type(entry))
-                    pprint(entry)
                     
                     try:
                         logger.info(f"from process_individual_ticket Creating comment for ticket ")
@@ -549,6 +628,8 @@ def extract_assigned_tech(ticket_id, ticket_info):
         str: Assigned technician's name or "Unassigned" if unavailable.
     """
     assigned_tech_info = ticket_info.get("assigned_tech")
+    if isinstance(assigned_tech_info, str) and assigned_tech_info.strip():
+        return assigned_tech_info
     if isinstance(assigned_tech_info, dict):
         return assigned_tech_info.get("name", "Unassigned")
     
@@ -585,6 +666,371 @@ def extract_notes_and_conversations(ticket_id, ticket_info):
         conversations = []
 
     return notes, conversations
+
+
+def build_ticket_result(
+    client,
+    ticket_id,
+    display_id,
+    result,
+    reason=None,
+    syncro_ticket_id=None,
+    comment_failures=0,
+    comment_count=0,
+):
+    """Build a structured outcome for one ticket import attempt."""
+    return {
+        "customer": client,
+        "ticket_id": ticket_id,
+        "display_id": display_id,
+        "result": result,
+        "reason": reason,
+        "syncro_ticket_id": syncro_ticket_id,
+        "comment_failures": comment_failures,
+        "comment_count": comment_count,
+    }
+
+
+def log_ticket_result(ticket_result):
+    """Log a ticket outcome with consistent context."""
+    logger.info(
+        "ticket_result customer=%s ticket_id=%s display_id=%s result=%s reason=%s syncro_ticket_id=%s comment_failures=%s comment_count=%s",
+        ticket_result["customer"],
+        ticket_result["ticket_id"],
+        ticket_result["display_id"],
+        ticket_result["result"],
+        ticket_result["reason"],
+        ticket_result["syncro_ticket_id"],
+        ticket_result["comment_failures"],
+        ticket_result["comment_count"],
+    )
+
+
+def log_import_summary(results):
+    """Log a compact summary of the overall import run."""
+    summary = {}
+    for result in results:
+        summary[result["result"]] = summary.get(result["result"], 0) + 1
+
+    logger.info(
+        "import_summary total=%s would_create=%s created=%s skipped_duplicate=%s skipped_missing_customer=%s "
+        "skipped_missing_required_fields=%s failed_date_conversion=%s failed_payload_prepare=%s "
+        "failed_ticket_create=%s failed_customer_processing=%s created_with_comment_failures=%s",
+        len(results),
+        summary.get("would_create", 0),
+        summary.get("created", 0),
+        summary.get("skipped_duplicate", 0),
+        summary.get("skipped_missing_customer", 0),
+        summary.get("skipped_missing_required_fields", 0),
+        summary.get("failed_date_conversion", 0),
+        summary.get("failed_payload_prepare", 0),
+        summary.get("failed_ticket_create", 0),
+        summary.get("failed_customer_processing", 0),
+        summary.get("created_with_comment_failures", 0),
+    )
+
+
+def process_customer_tickets(client, tickets):
+    """
+    Process tickets for a specific customer.
+
+    Returns:
+        list: Structured ticket outcome dictionaries.
+    """
+    ticket_results = []
+    try:
+        logger.info(f"Fetching Syncro tickets for customer: {client}")
+
+        syncro_customer_id = get_customer_id_by_name(client)
+        if not syncro_customer_id:
+            logger.warning(f"Customer '{client}' not found in Syncro. Skipping.")
+            for ticket_id, ticket_info in tickets.items():
+                result = build_ticket_result(
+                    client,
+                    ticket_id,
+                    ticket_info.get("displayId"),
+                    "skipped_missing_customer",
+                    reason="customer_not_found_in_syncro",
+                )
+                log_ticket_result(result)
+                ticket_results.append(result)
+            return ticket_results
+
+        syncro_tickets = get_all_tickets_for_customer(client)
+        syncro_tickets_subjects_dates = extract_ticket_subjects_and_dates(syncro_tickets)
+        matched_ticket_ids = compare_tickets_by_subject(tickets, syncro_tickets_subjects_dates)
+        logger.info(f"Matched Ticket Ids: {matched_ticket_ids}")
+
+        for ticket_id, ticket_info in tickets.items():
+            ticket_results.append(
+                process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
+            )
+
+    except Exception as e:
+        logger.error(f"Error processing customer {client}: {e}", exc_info=True)
+        for ticket_id, ticket_info in tickets.items():
+            result = build_ticket_result(
+                client,
+                ticket_id,
+                ticket_info.get("displayId"),
+                "failed_customer_processing",
+                reason=str(e),
+            )
+            log_ticket_result(result)
+            ticket_results.append(result)
+
+    return ticket_results
+
+
+def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids):
+    """Process an individual ticket and return a structured outcome."""
+    display_id = ticket_info.get("displayId")
+    subject_base = ticket_info.get("subject")
+    subject = ticket_info.get("subject", "") + f" {display_id}"
+    created_time = ticket_info.get("created_time")
+
+    logger.info(
+        "Processing ticket customer=%s ticket_id=%s display_id=%s subject=%s",
+        client,
+        ticket_id,
+        display_id,
+        subject,
+    )
+
+    if not subject_base or not created_time:
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "skipped_missing_required_fields",
+            reason="missing_subject_or_created_time",
+        )
+        log_ticket_result(result)
+        return result
+
+    try:
+        converted_created_time = get_syncro_created_date(created_time)
+    except Exception as date_error:
+        logger.error(
+            "Date conversion failed for customer=%s ticket_id=%s display_id=%s: %s",
+            client,
+            ticket_id,
+            display_id,
+            date_error,
+            exc_info=True,
+        )
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "failed_date_conversion",
+            reason=str(date_error),
+        )
+        log_ticket_result(result)
+        return result
+
+    source_status = ticket_info.get("status")
+    status = get_syncro_status(source_status, default_status="Resolved")
+    priority = ticket_info.get("priority", "Unknown")
+    assigned_tech = extract_assigned_tech(ticket_id, ticket_info)
+    description = ticket_info.get("description", "No description available.")
+    contact = ticket_info.get("contact")
+    notes, conversations = extract_notes_and_conversations(ticket_id, ticket_info)
+
+    if notes or conversations:
+        timeline = combine_notes_and_conversations(notes, conversations)
+    else:
+        timeline = []
+        logger.info(f"Ticket {display_id}: No notes or conversations found.")
+
+    preview_comment_count = sum(
+        1 for entry in timeline if isinstance(entry, dict) and entry.get("type") != "DESCRIPTION"
+    )
+
+    if display_id in matched_ticket_ids:
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "skipped_duplicate",
+            reason="matched_existing_syncro_ticket",
+        )
+        log_ticket_result(result)
+        return result
+
+    try:
+        new_syncro_ticket = syncro_prepare_ticket_json_superops(
+            client,
+            contact,
+            display_id,
+            subject,
+            converted_created_time,
+            status,
+            priority,
+            assigned_tech,
+            description,
+            timeline,
+        )
+    except Exception as payload_error:
+        logger.error(
+            "Payload preparation failed for customer=%s ticket_id=%s display_id=%s: %s",
+            client,
+            ticket_id,
+            display_id,
+            payload_error,
+            exc_info=True,
+        )
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "failed_payload_prepare",
+            reason=str(payload_error),
+        )
+        log_ticket_result(result)
+        return result
+
+    if DRY_RUN:
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "would_create",
+            reason="dry_run_preview",
+            comment_count=preview_comment_count,
+        )
+        log_ticket_result(result)
+        return result
+
+    logger.info(f"Attempting to create Ticket: {new_syncro_ticket}")
+    created_ticket_response = syncro_create_ticket(new_syncro_ticket)
+    if not created_ticket_response or "ticket" not in created_ticket_response:
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "failed_ticket_create",
+            reason="syncro_create_ticket_returned_no_ticket",
+        )
+        log_ticket_result(result)
+        return result
+
+    created_ticket_id = created_ticket_response["ticket"].get("id")
+    created_ticket_number = created_ticket_response["ticket"].get("number")
+    logger.info(f"Successfully created Syncro Ticket: {created_ticket_number} (ID: {created_ticket_id})")
+
+    if pauser_on:
+        input("Pausing for Ticket Creation - Press Enter to continue...")
+
+    comment_failures = 0
+    for entry in timeline:
+        if not isinstance(entry, dict):
+            logger.warning(
+                "Skipping non-dict timeline entry for customer=%s ticket_id=%s display_id=%s entry=%s",
+                client,
+                ticket_id,
+                display_id,
+                entry,
+            )
+            comment_failures += 1
+            continue
+
+        if entry.get("type") == "DESCRIPTION":
+            logger.info(f"Skipping DESCRIPTION entry for ticket {created_ticket_number}: {entry}")
+            continue
+
+        try:
+            formatted_comment = build_syncro_comment(entry)
+            comment_response = syncro_create_comment(formatted_comment, created_ticket_id)
+            if comment_response is None:
+                comment_failures += 1
+                logger.error(
+                    "Comment creation returned no response for customer=%s ticket_id=%s display_id=%s ticket_number=%s",
+                    client,
+                    ticket_id,
+                    display_id,
+                    created_ticket_number,
+                )
+        except Exception as comment_error:
+            comment_failures += 1
+            logger.error(
+                "Comment creation failed for customer=%s ticket_id=%s display_id=%s ticket_number=%s: %s",
+                client,
+                ticket_id,
+                display_id,
+                created_ticket_number,
+                comment_error,
+                exc_info=True,
+            )
+
+    if pauser_on:
+        input("Pausing for Comments added to Ticket - Press Enter to continue...")
+
+    result_name = "created_with_comment_failures" if comment_failures else "created"
+    reason = "comment_failures_present" if comment_failures else None
+    result = build_ticket_result(
+        client,
+        ticket_id,
+        display_id,
+        result_name,
+        reason=reason,
+        syncro_ticket_id=created_ticket_id,
+        comment_failures=comment_failures,
+        comment_count=preview_comment_count,
+    )
+    log_ticket_result(result)
+    return result
+
+
+def process_all_clients():
+    """Fetch clients and process their tickets one customer at a time."""
+    run_results = []
+    remaining_ticket_cap = MAX_TICKETS_TO_IMPORT
+    logger.info(
+        "Starting import run mode=%s max_tickets_to_import=%s",
+        "dry_run" if DRY_RUN else "write",
+        remaining_ticket_cap,
+    )
+    clients_response = make_api_call(
+        QUERY_GET_CLIENT_LIST, {"input": {"page": 1, "pageSize": 100}}
+    )
+
+    if (
+        clients_response is None
+        or "data" not in clients_response
+        or clients_response["data"].get("getClientList") is None
+    ):
+        logger.error("Failed to retrieve client list from SuperOps.")
+        return run_results
+
+    for client in clients_response["data"]["getClientList"]["clients"]:
+        if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
+            logger.info("Global ticket cap reached. Stopping before client %s.", client["name"])
+            break
+
+        account_id = client["accountId"]
+        client_name = client["name"]
+
+        tickets = get_tickets_for_client(account_id, remaining_ticket_cap=remaining_ticket_cap)
+        logger.info(f"Tickets found for {client_name}: {len(tickets)}")
+
+        client_ticket_info = {}
+        for ticket in tickets:
+            ticket_id = ticket.get("ticketId")
+            if ticket_id:
+                client_ticket_info[ticket_id] = normalize_superops_ticket(ticket)
+
+        run_results.extend(process_customer_tickets(client_name, client_ticket_info))
+        if remaining_ticket_cap is not None:
+            remaining_ticket_cap -= len(client_ticket_info)
+            logger.info(
+                "Remaining global ticket cap after client %s: %s",
+                client_name,
+                remaining_ticket_cap,
+            )
+
+    log_import_summary(run_results)
+    return run_results
 
 # Main Execution
 if __name__ == "__main__":
