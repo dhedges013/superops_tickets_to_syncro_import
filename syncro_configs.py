@@ -4,6 +4,7 @@ from datetime import datetime
 
 # syncro_configs.py
 SYNCRO_TIMEZONE = "America/New_York"
+SUPEROPS_SOURCE_TIMEZONE = "UTC"
 TICKETS_CSV_PATH = "tickets.csv"
 COMMENTS_CSV_PATH = "ticket_comments.csv"
 TEMP_FILE_PATH = "syncro_temp_data.json"
@@ -22,6 +23,13 @@ try:
 
     SYNCRO_SUBDOMAIN = LOCAL_SYNCRO_SUBDOMAIN
     SYNCRO_API_KEY = LOCAL_SYNCRO_API_KEY
+except ImportError:
+    pass
+
+try:
+    from local_config import SUPEROPS_SOURCE_TIMEZONE as LOCAL_SUPEROPS_SOURCE_TIMEZONE
+
+    SUPEROPS_SOURCE_TIMEZONE = LOCAL_SUPEROPS_SOURCE_TIMEZONE
 except ImportError:
     pass
 

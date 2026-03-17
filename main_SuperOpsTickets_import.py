@@ -1,10 +1,11 @@
 import requests
 import time
+from datetime import datetime
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
 from syncro_configs import get_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date, get_syncro_status
-from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment
+from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment, build_syncro_initial_issue
 from syncro_write import syncro_create_ticket, syncro_create_comment
 
 #change to pauser_on to "yes" to have the import wait for each ticket and/or comment to review
@@ -13,6 +14,74 @@ pauser_on = None
 
 # Initialize Logger
 logger = get_logger(__name__)
+
+
+class FatalImportValidationError(Exception):
+    """Stop the import when historical timestamps are invalid."""
+
+
+def parse_syncro_timestamp(timestamp_str):
+    """Parse a normalized Syncro timestamp string."""
+    return datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S%z")
+
+
+def build_and_validate_historical_comments(
+    client,
+    ticket_id,
+    display_id,
+    ticket_created_at,
+    description,
+    contact,
+    timeline,
+):
+    """Build normalized comment payloads and enforce chronological ordering."""
+    comment_payloads = []
+
+    if description and description != "No description available.":
+        comment_payloads.append(build_syncro_initial_issue(description, contact, ticket_created_at))
+
+    for entry in timeline:
+        if not isinstance(entry, dict):
+            logger.warning(
+                "Skipping non-dict timeline entry during chronology validation for customer=%s ticket_id=%s display_id=%s entry=%s",
+                client,
+                ticket_id,
+                display_id,
+                entry,
+            )
+            continue
+
+        if entry.get("type") == "DESCRIPTION":
+            continue
+
+        comment_payloads.append(build_syncro_comment(entry))
+
+    ticket_created_dt = parse_syncro_timestamp(ticket_created_at)
+    previous_comment_dt = None
+
+    for index, payload in enumerate(comment_payloads):
+        created_at = payload.get("created_at")
+        if not created_at:
+            raise FatalImportValidationError(
+                f"Missing created_at on comment payload for customer={client} ticket_id={ticket_id} display_id={display_id}"
+            )
+
+        comment_dt = parse_syncro_timestamp(created_at)
+        if comment_dt < ticket_created_dt:
+            raise FatalImportValidationError(
+                f"Comment timestamp precedes ticket creation for customer={client} ticket_id={ticket_id} display_id={display_id}: "
+                f"ticket_created_at={ticket_created_at} comment_created_at={created_at}"
+            )
+
+        if previous_comment_dt and comment_dt < previous_comment_dt:
+            raise FatalImportValidationError(
+                f"Comment timestamps are out of order for customer={client} ticket_id={ticket_id} display_id={display_id}: "
+                f"previous_comment_created_at={comment_payloads[index - 1]['created_at']} comment_created_at={created_at}"
+            )
+
+        previous_comment_dt = comment_dt
+
+    return comment_payloads
 
 
 
@@ -340,10 +409,15 @@ def combine_notes_and_conversations(notes, conversations):
 
     # Process notes
     for note in notes:
+        added_by = note.get("addedBy")
+        if not isinstance(added_by, dict):
+            logger.warning(f"Note entry is missing addedBy user info: {note}")
+            added_by = {}
+
         merged_items.append({
             "type": "NOTE",
             "content": note.get("content", "No Content"),
-            "user": note.get("addedBy", {}).get("name", "Unknown"),
+            "user": added_by.get("name", "Unknown"),
             "time": note.get("addedOn", "Unknown Time")
         })
 
@@ -715,7 +789,7 @@ def log_import_summary(results):
     logger.info(
         "import_summary total=%s would_create=%s created=%s skipped_duplicate=%s skipped_missing_customer=%s "
         "skipped_missing_required_fields=%s failed_date_conversion=%s failed_payload_prepare=%s "
-        "failed_ticket_create=%s failed_customer_processing=%s created_with_comment_failures=%s",
+        "failed_ticket_create=%s failed_ticket_processing=%s failed_customer_processing=%s created_with_comment_failures=%s",
         len(results),
         summary.get("would_create", 0),
         summary.get("created", 0),
@@ -725,6 +799,7 @@ def log_import_summary(results):
         summary.get("failed_date_conversion", 0),
         summary.get("failed_payload_prepare", 0),
         summary.get("failed_ticket_create", 0),
+        summary.get("failed_ticket_processing", 0),
         summary.get("failed_customer_processing", 0),
         summary.get("created_with_comment_failures", 0),
     )
@@ -762,10 +837,33 @@ def process_customer_tickets(client, tickets):
         logger.info(f"Matched Ticket Ids: {matched_ticket_ids}")
 
         for ticket_id, ticket_info in tickets.items():
-            ticket_results.append(
-                process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
-            )
+            try:
+                ticket_results.append(
+                    process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
+                )
+            except FatalImportValidationError:
+                raise
+            except Exception as ticket_error:
+                logger.error(
+                    "Error processing ticket customer=%s ticket_id=%s display_id=%s: %s",
+                    client,
+                    ticket_id,
+                    ticket_info.get("displayId"),
+                    ticket_error,
+                    exc_info=True,
+                )
+                result = build_ticket_result(
+                    client,
+                    ticket_id,
+                    ticket_info.get("displayId"),
+                    "failed_ticket_processing",
+                    reason=str(ticket_error),
+                )
+                log_ticket_result(result)
+                ticket_results.append(result)
 
+    except FatalImportValidationError:
+        raise
     except Exception as e:
         logger.error(f"Error processing customer {client}: {e}", exc_info=True)
         for ticket_id, ticket_info in tickets.items():
@@ -843,10 +941,6 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
         timeline = []
         logger.info(f"Ticket {display_id}: No notes or conversations found.")
 
-    preview_comment_count = sum(
-        1 for entry in timeline if isinstance(entry, dict) and entry.get("type") != "DESCRIPTION"
-    )
-
     if display_id in matched_ticket_ids:
         result = build_ticket_result(
             client,
@@ -857,6 +951,39 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
         )
         log_ticket_result(result)
         return result
+
+    try:
+        comment_payloads = build_and_validate_historical_comments(
+            client,
+            ticket_id,
+            display_id,
+            converted_created_time,
+            description,
+            contact,
+            timeline,
+        )
+    except FatalImportValidationError:
+        raise
+    except Exception as comment_payload_error:
+        logger.error(
+            "Comment payload preparation failed for customer=%s ticket_id=%s display_id=%s: %s",
+            client,
+            ticket_id,
+            display_id,
+            comment_payload_error,
+            exc_info=True,
+        )
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "failed_payload_prepare",
+            reason=str(comment_payload_error),
+        )
+        log_ticket_result(result)
+        return result
+
+    preview_comment_count = len(comment_payloads)
 
     try:
         new_syncro_ticket = syncro_prepare_ticket_json_superops(
@@ -923,25 +1050,9 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
         input("Pausing for Ticket Creation - Press Enter to continue...")
 
     comment_failures = 0
-    for entry in timeline:
-        if not isinstance(entry, dict):
-            logger.warning(
-                "Skipping non-dict timeline entry for customer=%s ticket_id=%s display_id=%s entry=%s",
-                client,
-                ticket_id,
-                display_id,
-                entry,
-            )
-            comment_failures += 1
-            continue
-
-        if entry.get("type") == "DESCRIPTION":
-            logger.info(f"Skipping DESCRIPTION entry for ticket {created_ticket_number}: {entry}")
-            continue
-
+    for payload in comment_payloads:
         try:
-            formatted_comment = build_syncro_comment(entry)
-            comment_response = syncro_create_comment(formatted_comment, created_ticket_id)
+            comment_response = syncro_create_comment(payload, created_ticket_id)
             if comment_response is None:
                 comment_failures += 1
                 logger.error(

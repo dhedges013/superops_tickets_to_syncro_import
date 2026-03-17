@@ -8,6 +8,7 @@ SYNCRO_API_KEY = "your_api_key"
 SUPEROPS_API_KEY = "Your SuperOps API Key"
 SUPEROPS_BASE_URL = "https://api.superops.ai/msp"
 SUPEROPS_CUSTOMER_SUBDOMAIN = "Your superops_subdomain"
+SUPEROPS_SOURCE_TIMEZONE = "UTC"
 
 # Import Mode
 DRY_RUN = False

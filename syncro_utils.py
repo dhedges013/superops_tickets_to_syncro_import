@@ -15,7 +15,7 @@ import logging
 import re
 
 import pytz  # Make sure to install pytz if not already installed
-from syncro_configs import SYNCRO_TIMEZONE
+from syncro_configs import SYNCRO_TIMEZONE, SUPEROPS_SOURCE_TIMEZONE
 _temp_data_cache = None  # Global cache for temp data
 
 # Establish a session for Syncro API interactions with default headers
@@ -483,7 +483,7 @@ def get_syncro_tech(tech_name: str):
 
 
 
-def build_syncro_initial_issue(initial_issue: str, syncroContact: str, created_at: str) -> list:
+def build_syncro_initial_issue(initial_issue: str, syncroContact: str, created_at: str) -> dict:
     """
     Build the JSON object for the initial issue in Syncro.
 
@@ -493,7 +493,7 @@ def build_syncro_initial_issue(initial_issue: str, syncroContact: str, created_a
         created_at (str): Timestamp for the initial issue comment.
 
     Returns:
-        list: A list representing the comments for the initial issue.
+        dict: A comment payload representing the initial issue.
 
     Logs:
         - Info for successfully built JSON object.
@@ -522,24 +522,18 @@ def build_syncro_initial_issue(initial_issue: str, syncroContact: str, created_a
         initial_issue = initial_issue if initial_issue else "none"
         syncroContact = syncroContact if syncroContact else "none"
 
-        # Build the JSON structure as a list of comments
-        initial_issue_comments = [
-            {
-                "subject": "initial issue",
-                "body": initial_issue,
-                "hidden": True,
-                "do_not_email": True,
-                "tech": syncroContact,
-                "created_at": created_at
-            }
-        ]
+        initial_issue_comment = {
+            "subject": "initial issue",
+            "body": initial_issue,
+            "hidden": True,
+            "do_not_email": True,
+            "tech": syncroContact,
+            "created_at": created_at,
+        }
 
-        
+        logger.info(f"Successfully built initial issue comment: {initial_issue_comment}")
 
-        # Log the built JSON
-        logger.info(f"Successfully built initial issue comments: {initial_issue_comments}")
-
-        return initial_issue_comments
+        return initial_issue_comment
 
     except ValueError as ve:
         # Log value errors
@@ -575,7 +569,7 @@ def build_syncro_comment(comment: dict) -> dict:
 
         # Ensure required keys exist with correct defaults
         content = comment.get("content")
-        time = comment.get("time", "")  # Keep empty if missing
+        time = comment.get("time")
         type_ = comment.get("type")
         user = comment.get("user")
 
@@ -589,6 +583,11 @@ def build_syncro_comment(comment: dict) -> dict:
         if user is None:
             user = "none"
 
+        if not time:
+            raise ValueError(f"Comment is missing a timestamp: {comment}")
+
+        created_at = get_syncro_created_date(time)
+
         # Create formatted Syncro comment
         syncro_comment = {
             "subject": type_,
@@ -596,7 +595,7 @@ def build_syncro_comment(comment: dict) -> dict:
             "hidden": True,
             "do_not_email": True,
             "tech": user,
-            "created_at": time
+            "created_at": created_at
         }
 
         # Log the built JSON
@@ -607,6 +606,79 @@ def build_syncro_comment(comment: dict) -> dict:
     except Exception as e:
         logger.error(f"Unexpected error occurred while building Syncro comment: {e}", exc_info=True)
         raise
+
+
+def convert_source_timestamp_to_syncro_timezone(created: str) -> str:
+    """Convert a source timestamp into Syncro's configured timezone."""
+    def parse_datetime_with_optional_timezone(date_str: str) -> datetime:
+        aware_formats = [
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+        ]
+        naive_formats = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%d-%m-%Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%m/%d/%Y %H:%M",
+            "%m-%d-%y",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+        ]
+
+        normalized_str = date_str.strip()
+        if normalized_str.endswith("Z"):
+            normalized_str = normalized_str[:-1] + "+00:00"
+
+        for fmt in aware_formats:
+            try:
+                return datetime.strptime(normalized_str, fmt)
+            except ValueError:
+                continue
+
+        try:
+            parsed_with_builtin = datetime.fromisoformat(normalized_str)
+            if parsed_with_builtin.tzinfo is not None:
+                return parsed_with_builtin
+        except ValueError:
+            pass
+
+        for fmt in naive_formats:
+            try:
+                return datetime.strptime(normalized_str, fmt)
+            except ValueError:
+                continue
+
+        raise ValueError(f"Unrecognized date format: {date_str}")
+
+    if not isinstance(created, str) or not created.strip():
+        raise ValueError(f"Date value is empty or not a string: {created!r}")
+
+    parsed_date = parse_datetime_with_optional_timezone(created)
+    syncro_timezone = pytz.timezone(SYNCRO_TIMEZONE)
+
+    if parsed_date.tzinfo is None:
+        source_timezone = pytz.timezone(SUPEROPS_SOURCE_TIMEZONE)
+        parsed_date = source_timezone.localize(parsed_date)
+        logger.info(
+            "Assuming source timezone %s for naive timestamp '%s'.",
+            SUPEROPS_SOURCE_TIMEZONE,
+            created,
+        )
+    else:
+        logger.info("Parsed timezone-aware timestamp '%s'.", created)
+
+    converted_date = parsed_date.astimezone(syncro_timezone)
+    formatted_date = converted_date.strftime("%Y-%m-%dT%H:%M:%S%z")
+    logger.info(
+        "Converted timestamp source=%s target=%s input='%s' output='%s'",
+        SUPEROPS_SOURCE_TIMEZONE,
+        SYNCRO_TIMEZONE,
+        created,
+        formatted_date,
+    )
+    return formatted_date
 
 
 
@@ -624,6 +696,8 @@ def get_syncro_created_date(created: str) -> str:
         - Info for successfully parsed and formatted dates.
         - Error if the input cannot be processed.
     """
+    return convert_source_timestamp_to_syncro_timezone(created)
+
     def is_iso8601_with_tz(date_str: str) -> bool:
         """
         Check if a given string is in ISO 8601 format with timezone offset.
@@ -1052,7 +1126,6 @@ def syncro_prepare_ticket_json_superops(client, contact, source_display_id, subj
     customer = client
     subject = subject
     tech = assigned_tech
-    initial_issue = description
     status = status    
     created = converted_created_time
     contact = contact if contact else "None"
@@ -1064,7 +1137,6 @@ def syncro_prepare_ticket_json_superops(client, contact, source_display_id, subj
     syncro_tech = get_syncro_tech(tech)
     syncro_created_date = get_syncro_created_date(created)
     syncro_contact = get_syncro_customer_contact(customer_id, contact)
-    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact, syncro_created_date)
     syncro_priority = get_syncro_priority(priority)
 
     # Create JSON payload
@@ -1073,7 +1145,6 @@ def syncro_prepare_ticket_json_superops(client, contact, source_display_id, subj
         "customer_id": customer_id,        
         "subject": subject,
         "user_id": syncro_tech,
-        "comments_attributes": initial_issue_comments,
         "status": status,        
         "created_at": syncro_created_date,
         "contact_id": syncro_contact,
@@ -1101,7 +1172,6 @@ def syncro_prepare_ticket_json(ticket):
     ticket_number = ticket.get("ticket number")
     subject = ticket.get("ticket subject")
     tech = ticket.get("tech")
-    initial_issue = ticket.get("ticket initial issue")
     status = ticket.get("ticket status")
     issue_type = ticket.get("ticket issue type")
     created = ticket.get("ticket created")
@@ -1114,7 +1184,6 @@ def syncro_prepare_ticket_json(ticket):
     syncro_tech = get_syncro_tech(tech)
     syncro_created_date = get_syncro_created_date(created)
     syncro_contact = get_syncro_customer_contact(customer_id, contact)
-    initial_issue_comments = build_syncro_initial_issue(initial_issue, contact, syncro_created_date)
     syncro_issue_type = get_syncro_issue_type(issue_type)
     syncro_priority = get_syncro_priority(priority)
 
@@ -1124,7 +1193,6 @@ def syncro_prepare_ticket_json(ticket):
         "number": syncro_ticket_number,
         "subject": subject,
         "user_id": syncro_tech,
-        "comments_attributes": initial_issue_comments,
         "status": status,
         "problem_type": syncro_issue_type,
         "created_at": syncro_created_date,

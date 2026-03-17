@@ -2,13 +2,20 @@ import main_SuperOpsTickets_import
 import syncro_read
 import syncro_utils
 from main_SuperOpsTickets_import import (
+    FatalImportValidationError,
     build_ticket_result,
+    build_and_validate_historical_comments,
     extract_assigned_tech,
     extract_contact_name,
     normalize_superops_ticket,
     process_individual_ticket,
 )
-from syncro_utils import get_next_available_syncro_ticket_number, get_syncro_status
+from syncro_utils import (
+    get_next_available_syncro_ticket_number,
+    get_syncro_created_date,
+    get_syncro_status,
+    syncro_prepare_ticket_json_superops,
+)
 
 
 def test_extract_contact_name_from_superops_to_users():
@@ -118,8 +125,18 @@ def test_process_individual_ticket_returns_would_create_in_dry_run(monkeypatch):
         "contact": "Sally User",
         "notes": [],
         "conversations": [
-            {"type": "DESCRIPTION", "content": "Initial description", "time": 1, "user": {"name": "Customer"}},
-            {"type": "TECH_REPLY", "content": "Investigating", "time": 2, "user": {"name": "Tech One"}},
+            {
+                "type": "DESCRIPTION",
+                "content": "Initial description",
+                "time": "2025-02-07T19:21:47.000",
+                "user": {"name": "Customer"},
+            },
+            {
+                "type": "TECH_REPLY",
+                "content": "Investigating",
+                "time": "2025-02-07T19:25:47.000",
+                "user": {"name": "Tech One"},
+            },
         ],
     }
 
@@ -134,7 +151,7 @@ def test_process_individual_ticket_returns_would_create_in_dry_run(monkeypatch):
 
     assert result["result"] == "would_create"
     assert result["reason"] == "dry_run_preview"
-    assert result["comment_count"] == 1
+    assert result["comment_count"] == 2
 
 
 def test_process_individual_ticket_dry_run_skips_syncro_write_calls(monkeypatch):
@@ -165,6 +182,120 @@ def test_process_individual_ticket_dry_run_skips_syncro_write_calls(monkeypatch)
     result = process_individual_ticket("Client A", "123", ticket_info, [])
 
     assert result["result"] == "would_create"
+
+
+def test_syncro_prepare_ticket_json_superops_excludes_embedded_initial_issue(monkeypatch):
+    monkeypatch.setattr(syncro_utils, "get_customer_id_by_name", lambda value: 1)
+    monkeypatch.setattr(syncro_utils, "get_next_available_syncro_ticket_number", lambda value: "12345")
+    monkeypatch.setattr(syncro_utils, "get_syncro_tech", lambda value: 99)
+    monkeypatch.setattr(syncro_utils, "get_syncro_created_date", lambda value: value)
+    monkeypatch.setattr(syncro_utils, "get_syncro_customer_contact", lambda customer_id, contact: 55)
+    monkeypatch.setattr(syncro_utils, "get_syncro_priority", lambda value: "High")
+
+    payload = syncro_prepare_ticket_json_superops(
+        "Client A",
+        "Sally User",
+        "SO-123",
+        "Printer issue SO-123",
+        "2025-02-07T19:21:47-0500",
+        "Resolved",
+        "High",
+        "Tech One",
+        "Initial description",
+        [],
+    )
+
+    assert payload["created_at"] == "2025-02-07T19:21:47-0500"
+    assert "comments_attributes" not in payload
+
+
+def test_get_syncro_created_date_converts_from_configured_source_timezone(monkeypatch):
+    monkeypatch.setattr(syncro_utils, "SUPEROPS_SOURCE_TIMEZONE", "America/Chicago")
+    monkeypatch.setattr(syncro_utils, "SYNCRO_TIMEZONE", "America/New_York")
+
+    assert get_syncro_created_date("2025-07-17T15:43:18.255") == "2025-07-17T16:43:18-0400"
+
+
+def test_build_and_validate_historical_comments_raises_for_comment_before_ticket():
+    timeline = [
+        {
+            "type": "TECH_REPLY",
+            "content": "Investigating",
+            "time": "2025-07-17T15:30:00.000",
+            "user": "Tech One",
+        }
+    ]
+
+    try:
+        build_and_validate_historical_comments(
+            "Client A",
+            "123",
+            "SO-123",
+            "2025-07-17T16:43:18-0400",
+            "Initial description",
+            "Sally User",
+            timeline,
+        )
+    except FatalImportValidationError as exc:
+        assert "precedes ticket creation" in str(exc)
+    else:
+        raise AssertionError("Expected FatalImportValidationError for out-of-order timestamps")
+
+
+def test_process_individual_ticket_creates_initial_issue_comment_first(monkeypatch):
+    ticket_info = {
+        "displayId": "SO-123",
+        "subject": "Printer issue",
+        "created_time": "2025-02-07T19:21:47-0500",
+        "priority": "High",
+        "assigned_tech": "Tech One",
+        "description": "Initial description",
+        "contact": "Sally User",
+        "notes": [],
+        "conversations": [],
+    }
+    created_comments = []
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "DRY_RUN", False)
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_syncro_created_date", lambda value: value)
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_syncro_status", lambda value, default_status=None: "Resolved")
+    monkeypatch.setattr(
+        main_SuperOpsTickets_import,
+        "extract_notes_and_conversations",
+        lambda ticket_id, ticket_info: (["note"], ["conversation"]),
+    )
+    monkeypatch.setattr(
+        main_SuperOpsTickets_import,
+        "combine_notes_and_conversations",
+        lambda notes, conversations: [
+            {"type": "TECH_REPLY", "content": "Investigating", "time": "2025-02-07T19:30:00.000", "user": "Tech One"}
+        ],
+    )
+    monkeypatch.setattr(
+        main_SuperOpsTickets_import,
+        "syncro_prepare_ticket_json_superops",
+        lambda *args, **kwargs: {"subject": "Printer issue SO-123", "created_at": "2025-02-07T19:21:47-0500"},
+    )
+    monkeypatch.setattr(
+        main_SuperOpsTickets_import,
+        "syncro_create_ticket",
+        lambda payload: {"ticket": {"id": 42, "number": "T42"}},
+    )
+
+    def fake_syncro_create_comment(payload, created_ticket_id):
+        created_comments.append((payload, created_ticket_id))
+        return {"comment": {"id": len(created_comments)}}
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "syncro_create_comment", fake_syncro_create_comment)
+
+    result = process_individual_ticket("Client A", "123", ticket_info, [])
+
+    assert result["result"] == "created"
+    assert result["comment_count"] == 2
+    assert created_comments[0][0]["subject"] == "initial issue"
+    assert created_comments[0][0]["created_at"] == "2025-02-07T19:21:47-0500"
+    assert created_comments[0][1] == 42
+    assert created_comments[1][0]["subject"] == "TECH_REPLY"
 
 
 def test_get_syncro_status_exact_match(monkeypatch):
