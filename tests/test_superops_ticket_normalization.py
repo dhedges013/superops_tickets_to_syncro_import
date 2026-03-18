@@ -2,7 +2,6 @@ import main_SuperOpsTickets_import
 import syncro_read
 import syncro_utils
 from main_SuperOpsTickets_import import (
-    FatalImportValidationError,
     build_ticket_result,
     build_and_validate_historical_comments,
     extract_assigned_tech,
@@ -216,7 +215,7 @@ def test_get_syncro_created_date_converts_from_configured_source_timezone(monkey
     assert get_syncro_created_date("2025-07-17T15:43:18.255") == "2025-07-17T16:43:18-0400"
 
 
-def test_build_and_validate_historical_comments_raises_for_comment_before_ticket():
+def test_build_and_validate_historical_comments_logs_issue_for_comment_before_ticket():
     timeline = [
         {
             "type": "TECH_REPLY",
@@ -226,20 +225,19 @@ def test_build_and_validate_historical_comments_raises_for_comment_before_ticket
         }
     ]
 
-    try:
-        build_and_validate_historical_comments(
-            "Client A",
-            "123",
-            "SO-123",
-            "2025-07-17T16:43:18-0400",
-            "Initial description",
-            "Sally User",
-            timeline,
-        )
-    except FatalImportValidationError as exc:
-        assert "precedes ticket creation" in str(exc)
-    else:
-        raise AssertionError("Expected FatalImportValidationError for out-of-order timestamps")
+    comment_payloads, chronology_issues = build_and_validate_historical_comments(
+        "Client A",
+        "123",
+        "SO-123",
+        "2025-07-17T16:43:18-0400",
+        "Initial description",
+        "Sally User",
+        timeline,
+    )
+
+    assert len(comment_payloads) == 2
+    assert len(chronology_issues) == 1
+    assert "precedes ticket creation" in chronology_issues[0]
 
 
 def test_process_individual_ticket_creates_initial_issue_comment_first(monkeypatch):

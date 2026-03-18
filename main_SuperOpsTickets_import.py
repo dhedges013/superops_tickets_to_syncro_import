@@ -2,7 +2,7 @@ import requests
 import time
 from datetime import datetime
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
-from syncro_configs import get_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
+from syncro_configs import get_logger, get_chronology_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date, get_syncro_status
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment, build_syncro_initial_issue
@@ -14,10 +14,7 @@ pauser_on = None
 
 # Initialize Logger
 logger = get_logger(__name__)
-
-
-class FatalImportValidationError(Exception):
-    """Stop the import when historical timestamps are invalid."""
+chronology_logger = get_chronology_logger("chronology")
 
 
 def parse_syncro_timestamp(timestamp_str):
@@ -34,8 +31,9 @@ def build_and_validate_historical_comments(
     contact,
     timeline,
 ):
-    """Build normalized comment payloads and enforce chronological ordering."""
+    """Build normalized comment payloads and record chronology issues."""
     comment_payloads = []
+    chronology_issues = []
 
     if description and description != "No description available.":
         comment_payloads.append(build_syncro_initial_issue(description, contact, ticket_created_at))
@@ -62,26 +60,27 @@ def build_and_validate_historical_comments(
     for index, payload in enumerate(comment_payloads):
         created_at = payload.get("created_at")
         if not created_at:
-            raise FatalImportValidationError(
+            chronology_issues.append(
                 f"Missing created_at on comment payload for customer={client} ticket_id={ticket_id} display_id={display_id}"
             )
+            continue
 
         comment_dt = parse_syncro_timestamp(created_at)
         if comment_dt < ticket_created_dt:
-            raise FatalImportValidationError(
+            chronology_issues.append(
                 f"Comment timestamp precedes ticket creation for customer={client} ticket_id={ticket_id} display_id={display_id}: "
                 f"ticket_created_at={ticket_created_at} comment_created_at={created_at}"
             )
 
         if previous_comment_dt and comment_dt < previous_comment_dt:
-            raise FatalImportValidationError(
+            chronology_issues.append(
                 f"Comment timestamps are out of order for customer={client} ticket_id={ticket_id} display_id={display_id}: "
                 f"previous_comment_created_at={comment_payloads[index - 1]['created_at']} comment_created_at={created_at}"
             )
 
         previous_comment_dt = comment_dt
 
-    return comment_payloads
+    return comment_payloads, chronology_issues
 
 
 
@@ -841,8 +840,6 @@ def process_customer_tickets(client, tickets):
                 ticket_results.append(
                     process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
                 )
-            except FatalImportValidationError:
-                raise
             except Exception as ticket_error:
                 logger.error(
                     "Error processing ticket customer=%s ticket_id=%s display_id=%s: %s",
@@ -862,8 +859,6 @@ def process_customer_tickets(client, tickets):
                 log_ticket_result(result)
                 ticket_results.append(result)
 
-    except FatalImportValidationError:
-        raise
     except Exception as e:
         logger.error(f"Error processing customer {client}: {e}", exc_info=True)
         for ticket_id, ticket_info in tickets.items():
@@ -953,7 +948,7 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
         return result
 
     try:
-        comment_payloads = build_and_validate_historical_comments(
+        comment_payloads, chronology_issues = build_and_validate_historical_comments(
             client,
             ticket_id,
             display_id,
@@ -962,8 +957,6 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
             contact,
             timeline,
         )
-    except FatalImportValidationError:
-        raise
     except Exception as comment_payload_error:
         logger.error(
             "Comment payload preparation failed for customer=%s ticket_id=%s display_id=%s: %s",
@@ -982,6 +975,16 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
         )
         log_ticket_result(result)
         return result
+
+    if chronology_issues:
+        for issue in chronology_issues:
+            chronology_logger.warning(issue)
+        logger.warning(
+            "Chronology issues detected for customer=%s ticket_id=%s display_id=%s. See separate chronology log.",
+            client,
+            ticket_id,
+            display_id,
+        )
 
     preview_comment_count = len(comment_payloads)
 
@@ -1079,6 +1082,8 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
 
     result_name = "created_with_comment_failures" if comment_failures else "created"
     reason = "comment_failures_present" if comment_failures else None
+    if chronology_issues:
+        reason = "chronology_issue_logged" if reason is None else f"{reason};chronology_issue_logged"
     result = build_ticket_result(
         client,
         ticket_id,

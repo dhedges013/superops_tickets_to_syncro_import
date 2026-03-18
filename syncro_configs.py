@@ -44,6 +44,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_FILE_NAME = f"import_{RUN_ID}.log"
 LOG_FILE_PATH = os.path.join(LOG_DIR, LOG_FILE_NAME)
+CHRONOLOGY_LOG_FILE_NAME = f"chronology_{RUN_ID}.log"
+CHRONOLOGY_LOG_FILE_PATH = os.path.join(LOG_DIR, CHRONOLOGY_LOG_FILE_NAME)
 
 
 class RunContextFilter(logging.Filter):
@@ -85,6 +87,31 @@ def get_logger(name):
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = True
+    return logger
+
+
+def get_chronology_logger(name="chronology"):
+    configure_logging()
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    handler_exists = any(
+        isinstance(handler, logging.FileHandler)
+        and getattr(handler, "baseFilename", None) == CHRONOLOGY_LOG_FILE_PATH
+        for handler in logger.handlers
+    )
+    if not handler_exists:
+        file_handler = logging.FileHandler(CHRONOLOGY_LOG_FILE_PATH, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.addFilter(RunContextFilter())
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s run_id=%(run_id)s logger=%(name)s level=%(levelname)s %(message)s"
+            )
+        )
+        logger.addHandler(file_handler)
+
     return logger
 
 
