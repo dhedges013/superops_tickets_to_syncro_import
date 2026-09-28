@@ -1,8 +1,14 @@
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup  # Import BeautifulSoup for HTML stripping
-from syncro_configs import get_logger, get_chronology_logger, RATE_LIMIT_SECONDS  # Import logger and rate limit
+import pytz
+from syncro_configs import (
+    get_logger,
+    get_chronology_logger,
+    RATE_LIMIT_SECONDS,
+    SUPEROPS_SOURCE_TIMEZONE,
+)  # Import logger and rate limit
 from syncro_read import get_all_tickets_for_customer, extract_ticket_subjects_and_dates
 from syncro_utils import get_customer_id_by_name, get_syncro_created_date, get_syncro_status
 from syncro_utils import syncro_prepare_ticket_json_superops, build_syncro_comment, build_syncro_initial_issue
@@ -93,11 +99,13 @@ DEFAULT_BASE_URL = "https://api.superops.ai/msp"
 DEFAULT_CUSTOMER_SUBDOMAIN = "Your superops_subdomain"
 DEFAULT_DRY_RUN = False
 DEFAULT_MAX_TICKETS_TO_IMPORT = None
+DEFAULT_SUPEROPS_TICKETS_CREATED_WITHIN_DAYS = None
 API_KEY = DEFAULT_API_KEY
 BASE_URL = DEFAULT_BASE_URL
 CUSTOMER_SUBDOMAIN = DEFAULT_CUSTOMER_SUBDOMAIN
 DRY_RUN = DEFAULT_DRY_RUN
 MAX_TICKETS_TO_IMPORT = DEFAULT_MAX_TICKETS_TO_IMPORT
+SUPEROPS_TICKETS_CREATED_WITHIN_DAYS = DEFAULT_SUPEROPS_TICKETS_CREATED_WITHIN_DAYS
 
 try:
     from local_config import SUPEROPS_API_KEY as LOCAL_SUPEROPS_API_KEY
@@ -124,6 +132,15 @@ try:
 except ImportError:
     pass
 
+try:
+    from local_config import (
+        SUPEROPS_TICKETS_CREATED_WITHIN_DAYS as LOCAL_SUPEROPS_TICKETS_CREATED_WITHIN_DAYS,
+    )
+
+    SUPEROPS_TICKETS_CREATED_WITHIN_DAYS = LOCAL_SUPEROPS_TICKETS_CREATED_WITHIN_DAYS
+except ImportError:
+    pass
+
 
 def normalize_ticket_cap(ticket_cap):
     """Normalize an optional ticket cap into a positive integer or None."""
@@ -143,7 +160,96 @@ def normalize_ticket_cap(ticket_cap):
     return normalized_cap
 
 
+def normalize_ticket_created_within_days(days):
+    """Normalize an optional created-time day filter into a positive integer or None."""
+    if days in (None, "", 0):
+        return None
+
+    try:
+        normalized_days = int(days)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid SUPEROPS_TICKETS_CREATED_WITHIN_DAYS value: %r", days)
+        return None
+
+    if normalized_days <= 0:
+        logger.warning("Ignoring non-positive SUPEROPS_TICKETS_CREATED_WITHIN_DAYS value: %r", days)
+        return None
+
+    return normalized_days
+
+
+def get_superops_created_time_cutoff(days):
+    """Return an ISO-8601 UTC cutoff timestamp for createdTime filtering."""
+    normalized_days = normalize_ticket_created_within_days(days)
+    if normalized_days is None:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=normalized_days)
+    return cutoff.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_superops_created_datetime_cutoff(days):
+    """Return a UTC datetime cutoff for filtering fetched SuperOps tickets."""
+    normalized_days = normalize_ticket_created_within_days(days)
+    if normalized_days is None:
+        return None
+
+    return datetime.now(timezone.utc) - timedelta(days=normalized_days)
+
+
+def parse_superops_created_time(created_time):
+    """Parse a SuperOps createdTime value into a timezone-aware UTC datetime."""
+    if not isinstance(created_time, str) or not created_time.strip():
+        return None
+
+    normalized_str = created_time.strip()
+    if normalized_str.endswith("Z"):
+        normalized_str = normalized_str[:-1] + "+00:00"
+
+    parsed_date = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed_date = datetime.strptime(normalized_str, fmt)
+            break
+        except ValueError:
+            continue
+
+    if parsed_date is None:
+        try:
+            parsed_date = datetime.fromisoformat(normalized_str)
+        except ValueError:
+            logger.warning("Unable to parse SuperOps createdTime value: %r", created_time)
+            return None
+
+    if parsed_date.tzinfo is None:
+        source_timezone = pytz.timezone(SUPEROPS_SOURCE_TIMEZONE)
+        parsed_date = source_timezone.localize(parsed_date)
+
+    return parsed_date.astimezone(timezone.utc)
+
+
+def ticket_is_within_created_window(ticket, cutoff_datetime):
+    """Return True when the fetched SuperOps ticket should be kept for import."""
+    if cutoff_datetime is None:
+        return True
+
+    created_time = ticket.get("createdTime")
+    parsed_created_time = parse_superops_created_time(created_time)
+    if parsed_created_time is None:
+        logger.warning(
+            "Keeping ticket %s without createdTime filter because createdTime could not be parsed: %r",
+            ticket.get("ticketId"),
+            created_time,
+        )
+        return True
+
+    return parsed_created_time >= cutoff_datetime
+
+
 MAX_TICKETS_TO_IMPORT = normalize_ticket_cap(MAX_TICKETS_TO_IMPORT)
+SUPEROPS_TICKETS_CREATED_WITHIN_DAYS = normalize_ticket_created_within_days(
+    SUPEROPS_TICKETS_CREATED_WITHIN_DAYS
+)
 
 # Headers
 HEADERS = {
@@ -336,10 +442,17 @@ def get_tickets_for_client(account_id, remaining_ticket_cap=None):
     tickets = []
     page = 1
     page_size = 10
+    cutoff_datetime = get_superops_created_datetime_cutoff(SUPEROPS_TICKETS_CREATED_WITHIN_DAYS)
+    cutoff_time = (
+        cutoff_datetime.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if cutoff_datetime is not None
+        else None
+    )
     logger.info(
-        "Getting tickets for client %s remaining_ticket_cap=%s",
+        "Getting tickets for client %s remaining_ticket_cap=%s created_since=%s",
         account_id,
         remaining_ticket_cap,
+        cutoff_time,
     )
 
     if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
@@ -369,6 +482,16 @@ def get_tickets_for_client(account_id, remaining_ticket_cap=None):
 
         logger.info(f"Tickets for client {account_id}: {len(ticket_data['tickets'])}")
         for ticket in ticket_data["tickets"]:
+            if not ticket_is_within_created_window(ticket, cutoff_datetime):
+                logger.info(
+                    "Skipping ticket %s for client %s because createdTime=%s is older than cutoff=%s",
+                    ticket.get("ticketId"),
+                    account_id,
+                    ticket.get("createdTime"),
+                    cutoff_time,
+                )
+                continue
+
             if remaining_ticket_cap is not None and len(tickets) >= remaining_ticket_cap:
                 logger.info(
                     "Reached remaining ticket cap for client %s at %s tickets.",

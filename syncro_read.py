@@ -48,8 +48,8 @@ def syncro_api_get(endpoint: str, params: dict = None):
     """
     increment_api_call_count()
     all_data = []
-    if params is None:
-        params = {}
+    # Do not mutate a caller-owned params dictionary while adding pagination.
+    params = dict(params or {})
     current_page = 1
 
     logger.info(f"Starting to fetch data from endpoint: {endpoint}")
@@ -69,8 +69,21 @@ def syncro_api_get(endpoint: str, params: dict = None):
 
         logger.info(f"Fetched {len(page_data)} records from page {current_page}.")
 
-        meta = response.get("meta", {})
-        if not meta.get("next_page"):
+        meta = response.get("meta", {}) or {}
+
+        # Syncro's REST API documents `total_pages`; some responses/versions
+        # also expose `next_page`.  The old implementation only checked the
+        # latter, so a customer account with more than the first 100 records
+        # was truncated after page 1.
+        next_page = meta.get("next_page")
+        if next_page is not None:
+            if not next_page:
+                break
+            current_page = int(next_page) if str(next_page).isdigit() else current_page + 1
+            continue
+
+        total_pages = meta.get("total_pages")
+        if total_pages is None or current_page >= int(total_pages):
             break
 
         current_page += 1

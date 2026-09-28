@@ -6,8 +6,10 @@ from main_SuperOpsTickets_import import (
     build_and_validate_historical_comments,
     extract_assigned_tech,
     extract_contact_name,
+    get_superops_created_datetime_cutoff,
     normalize_superops_ticket,
     process_individual_ticket,
+    ticket_is_within_created_window,
 )
 from syncro_utils import (
     get_next_available_syncro_ticket_number,
@@ -79,6 +81,91 @@ def test_build_ticket_result_creates_structured_outcome():
         "comment_failures": 0,
         "comment_count": 0,
     }
+
+
+def test_get_superops_created_datetime_cutoff_returns_none_when_disabled():
+    assert get_superops_created_datetime_cutoff(None) is None
+    assert get_superops_created_datetime_cutoff(0) is None
+    assert get_superops_created_datetime_cutoff("") is None
+
+
+def test_ticket_is_within_created_window_accepts_recent_ticket():
+    cutoff = main_SuperOpsTickets_import.parse_superops_created_time("2026-02-28T00:00:00.000")
+    ticket = {"ticketId": "123", "createdTime": "2026-03-15T09:30:00.000"}
+
+    assert ticket_is_within_created_window(ticket, cutoff) is True
+
+
+def test_ticket_is_within_created_window_rejects_old_ticket():
+    cutoff = main_SuperOpsTickets_import.parse_superops_created_time("2026-02-28T00:00:00.000")
+    ticket = {"ticketId": "123", "createdTime": "2026-01-15T09:30:00.000"}
+
+    assert ticket_is_within_created_window(ticket, cutoff) is False
+
+
+def test_get_tickets_for_client_filters_old_tickets_locally(monkeypatch):
+    captured_variables = []
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "SUPEROPS_TICKETS_CREATED_WITHIN_DAYS", 45)
+    monkeypatch.setattr(
+        main_SuperOpsTickets_import,
+        "get_superops_created_datetime_cutoff",
+        lambda days: main_SuperOpsTickets_import.parse_superops_created_time("2026-02-28T00:00:00.000"),
+    )
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_ticket_conversations", lambda ticket_id: [])
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_ticket_notes", lambda ticket_id: [])
+
+    def fake_make_api_call(query, variables=None):
+        captured_variables.append(variables)
+        return {
+            "data": {
+                "getTicketList": {
+                    "tickets": [
+                        {"ticketId": "newer", "createdTime": "2026-03-10T12:00:00.000"},
+                        {"ticketId": "older", "createdTime": "2026-01-10T12:00:00.000"},
+                    ],
+                    "listInfo": {"hasMore": False, "totalCount": "0"},
+                }
+            }
+        }
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "make_api_call", fake_make_api_call)
+
+    tickets = main_SuperOpsTickets_import.get_tickets_for_client("123")
+
+    assert [ticket["ticketId"] for ticket in tickets] == ["newer"]
+    operands = captured_variables[0]["input"]["condition"]["operands"]
+    assert operands == [{"attribute": "client.accountId", "operator": "contains", "value": "123"}]
+
+
+def test_get_tickets_for_client_keeps_all_tickets_when_filter_disabled(monkeypatch):
+    captured_variables = []
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "SUPEROPS_TICKETS_CREATED_WITHIN_DAYS", None)
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_ticket_conversations", lambda ticket_id: [])
+    monkeypatch.setattr(main_SuperOpsTickets_import, "get_ticket_notes", lambda ticket_id: [])
+
+    def fake_make_api_call(query, variables=None):
+        captured_variables.append(variables)
+        return {
+            "data": {
+                "getTicketList": {
+                    "tickets": [
+                        {"ticketId": "newer", "createdTime": "2026-03-10T12:00:00.000"},
+                        {"ticketId": "older", "createdTime": "2026-01-10T12:00:00.000"},
+                    ],
+                    "listInfo": {"hasMore": False, "totalCount": "0"},
+                }
+            }
+        }
+
+    monkeypatch.setattr(main_SuperOpsTickets_import, "make_api_call", fake_make_api_call)
+
+    tickets = main_SuperOpsTickets_import.get_tickets_for_client("123")
+
+    assert [ticket["ticketId"] for ticket in tickets] == ["newer", "older"]
+    operands = captured_variables[0]["input"]["condition"]["operands"]
+    assert operands == [{"attribute": "client.accountId", "operator": "contains", "value": "123"}]
 
 
 def test_process_individual_ticket_classifies_missing_required_fields():
