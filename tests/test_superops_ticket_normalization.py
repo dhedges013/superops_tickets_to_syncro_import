@@ -302,6 +302,45 @@ def test_get_syncro_created_date_converts_from_configured_source_timezone(monkey
     assert get_syncro_created_date("2025-07-17T15:43:18.255") == "2025-07-17T16:43:18-0400"
 
 
+def test_get_syncro_created_date_accepts_iso_timestamp_without_seconds(monkeypatch):
+    monkeypatch.setattr(syncro_utils, "SUPEROPS_SOURCE_TIMEZONE", "UTC")
+    monkeypatch.setattr(syncro_utils, "SYNCRO_TIMEZONE", "America/New_York")
+
+    assert get_syncro_created_date("2026-02-17T16:18") == "2026-02-17T11:18:00-0500"
+
+
+def test_build_and_validate_historical_comments_skips_invalid_comment_date():
+    timeline = [
+        {
+            "type": "TECH_REPLY",
+            "content": "Bad timestamp",
+            "time": "not-a-date",
+            "user": "Tech One",
+        },
+        {
+            "type": "TECH_REPLY",
+            "content": "Valid timestamp",
+            "time": "2025-07-17T17:00",
+            "user": "Tech One",
+        },
+    ]
+
+    comment_payloads, chronology_issues = build_and_validate_historical_comments(
+        "Client A",
+        "123",
+        "SO-123",
+        "2025-07-17T16:43:18-0400",
+        "Initial description",
+        "Sally User",
+        timeline,
+    )
+
+    assert len(comment_payloads) == 2
+    assert comment_payloads[1]["created_at"] == "2025-07-17T13:00:00-0400"
+    assert len(chronology_issues) == 1
+    assert "Skipped comment with invalid data" in chronology_issues[0]
+
+
 def test_build_and_validate_historical_comments_logs_issue_for_comment_before_ticket():
     timeline = [
         {

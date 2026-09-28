@@ -603,6 +603,11 @@ def build_syncro_comment(comment: dict) -> dict:
 
         return syncro_comment
 
+    except ValueError as e:
+        # Invalid source data is recoverable at the ticket level; the caller
+        # records the entry and skips only this comment.
+        logger.warning("Skipping Syncro comment because its input is invalid: %s", e)
+        raise
     except Exception as e:
         logger.error(f"Unexpected error occurred while building Syncro comment: {e}", exc_info=True)
         raise
@@ -639,8 +644,10 @@ def convert_source_timestamp_to_syncro_timezone(created: str) -> str:
 
         try:
             parsed_with_builtin = datetime.fromisoformat(normalized_str)
-            if parsed_with_builtin.tzinfo is not None:
-                return parsed_with_builtin
+            # fromisoformat handles ISO timestamps with optional seconds,
+            # fractional seconds, offsets, and the trailing-Z form after it
+            # has been normalized above (for example 2026-02-17T16:18).
+            return parsed_with_builtin
         except ValueError:
             pass
 

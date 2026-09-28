@@ -58,7 +58,19 @@ def build_and_validate_historical_comments(
         if entry.get("type") == "DESCRIPTION":
             continue
 
-        comment_payloads.append(build_syncro_comment(entry))
+        try:
+            comment_payloads.append(build_syncro_comment(entry))
+        except Exception as comment_error:
+            raw_comment_time = entry.get("time")
+            issue = (
+                f"Skipped comment with invalid data for customer={client} "
+                f"ticket_id={ticket_id} display_id={display_id} "
+                f"comment_index={len(comment_payloads)} "
+                f"comment_time={raw_comment_time!r}: {comment_error}"
+            )
+            chronology_issues.append(issue)
+            logger.warning(issue)
+            continue
 
     ticket_created_dt = parse_syncro_timestamp(ticket_created_at)
     previous_comment_dt = None
