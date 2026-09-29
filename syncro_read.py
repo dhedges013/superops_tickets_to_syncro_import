@@ -114,19 +114,22 @@ def syncro_get_ticket_data(ticket_id: int, key: str = None):
         return None
 
 def syncro_get_all_customers():
-    """Fetch all customers from SyncroMSP API and log their business_name and id."""
+    """Fetch all customers from SyncroMSP API and log only the total count."""
     customers = syncro_api_get('/customers')
-    customer_info = [{"id": customer.get("id"), "business_name": customer.get("business_name")} for customer in customers]
-    logger.info(f"Retrieved {len(customers)} customers: {customer_info}")
+    logger.info(f"Retrieved {len(customers)} customers.")
     return customers
 
 def syncro_get_all_contacts():
     """Fetch all contacts from SyncroMSP API."""
-    return syncro_api_get('/contacts')
+    contacts = syncro_api_get('/contacts')
+    logger.info(f"Retrieved {len(contacts)} contacts.")
+    return contacts
 
 def syncro_get_all_tickets():
     """Fetch all tickets from SyncroMSP API."""
-    return syncro_api_get('/tickets')
+    tickets = syncro_api_get('/tickets')
+    logger.info(f"Retrieved {len(tickets)} tickets.")
+    return tickets
 
 def get_syncro_ticket_by_number(ticket_number: str) -> dict:
     """
@@ -170,7 +173,7 @@ def get_syncro_ticket_by_number(ticket_number: str) -> dict:
         raise
 
 
-def get_all_tickets_for_customer(customer_name):
+def get_all_tickets_for_customer(customer_name, customer_id=None):
     """
     Fetches all tickets for a given customer from SyncroMSP using their customer ID.
     Handles pagination to retrieve all available tickets.
@@ -181,14 +184,13 @@ def get_all_tickets_for_customer(customer_name):
     Returns:
         list: A list of ticket dictionaries.
     """
-    # Step 1: Get Customer ID from Customer Name
-    customers = syncro_get_all_customers()
-    customer_id = None
-
-    for customer in customers:
-        if customer.get("business_name", "").strip().lower() == customer_name.strip().lower():
-            customer_id = customer.get("id")
-            break
+    # Step 1: Get Customer ID from Customer Name unless the caller already has it.
+    if customer_id is None:
+        customers = syncro_get_all_customers()
+        for customer in customers:
+            if customer.get("business_name", "").strip().lower() == customer_name.strip().lower():
+                customer_id = customer.get("id")
+                break
 
     if not customer_id:
         logger.warning(f"❌ Customer '{customer_name}' not found in Syncro.")
@@ -208,7 +210,14 @@ def get_all_tickets_for_customer(customer_name):
                 logger.error(f"❌ Failed to fetch tickets for '{customer_name}' (Page {page}).")
                 break
 
+            previous_count = len(tickets)
             tickets.extend(response["tickets"])
+            if len(tickets) // 10 > previous_count // 10:
+                logger.info(
+                    "[Syncro] Reading existing tickets for %s: %s found.",
+                    customer_name,
+                    len(tickets),
+                )
 
             # Check if there are more pages
             if not response.get("meta", {}).get("has_more", False):
@@ -221,6 +230,7 @@ def get_all_tickets_for_customer(customer_name):
             return []
 
     if tickets:
+        logger.info(f"[Syncro] Finished reading {len(tickets)} existing tickets for {customer_name}.")
         logger.info(f"✅ Retrieved {len(tickets)} tickets for customer '{customer_name}'.")
     else:
         logger.warning(f"⚠️ No tickets found for customer '{customer_name}'.")
@@ -263,8 +273,8 @@ def syncro_get_all_techs():
         # Fetch data using the syncro_api_get utility
         techs = syncro_api_get(endpoint)           
         
-        # Log the retrieved tech details
-        logger.info(f"Retrieved {len(techs)} techs: {techs}")
+        # Log the count without dumping every tech record.
+        logger.info(f"Retrieved {len(techs)} techs.")
         
         return techs
 

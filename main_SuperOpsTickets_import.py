@@ -275,27 +275,63 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 # GraphQL Queries
-QUERY_GET_CLIENT_LIST = """query getClientList($input: ListInfoInput!) { getClientList(input: $input) { clients { accountId name }}}"""
-QUERY_GET_TICKETS = """query getTicketList($input: ListInfoInput!) { getTicketList(input: $input) { tickets { ticketId displayId subject status priority createdTime } listInfo { hasMore totalCount }}}"""
+QUERY_GET_CLIENT_LIST = """query getClientList($input: ListInfoInput!) { getClientList(input: $input) { clients { accountId name } listInfo { page pageSize hasMore totalCount }}}"""
+QUERY_GET_TICKETS = """query getTicketList($input: ListInfoInput!) { getTicketList(input: $input) { tickets { ticketId displayId subject status priority createdTime } listInfo { page pageSize hasMore totalCount }}}"""
 QUERY_GET_TICKET_CONVERSATIONS = """query getTicketConversationList($input: TicketIdentifierInput!) { getTicketConversationList(input: $input) { conversationId content time user toUsers { user } ccUsers { user } bccUsers { user } attachments { fileName originalFileName fileSize } type }}"""
 QUERY_GET_TICKET_NOTES = """query getTicketNoteList($input: TicketIdentifierInput!) { getTicketNoteList(input: $input) { noteId addedBy addedOn content attachments { fileName originalFileName fileSize } privacyType }}"""
 
 # Function to make API calls
 def make_api_call(query, variables=None):
-
-    time.sleep(RATE_LIMIT_SECONDS)
-
     """Generic function to make GraphQL requests to SuperOps API"""
     payload = {"query": query, "variables": variables or {}}
+    max_attempts = 3
 
-    try:
-        response = session.request("POST", BASE_URL, json=payload)
-        response.raise_for_status()
-        return response.json()
+    for attempt in range(1, max_attempts + 1):
+        time.sleep(RATE_LIMIT_SECONDS if attempt == 1 else min(30, RATE_LIMIT_SECONDS * (2 ** (attempt - 1))))
+        try:
+            response = session.request("POST", BASE_URL, json=payload, timeout=60)
+            response.raise_for_status()
+            response_data = response.json()
+            graphql_errors = response_data.get("errors") if isinstance(response_data, dict) else None
+            if graphql_errors:
+                error_text = str(graphql_errors)
+                retryable = "rate_limit_exceeded" in error_text
+                if retryable and attempt < max_attempts:
+                    logger.warning(
+                        "SuperOps rate limit response; retrying attempt=%s/%s variables=%s",
+                        attempt + 1,
+                        max_attempts,
+                        variables or {},
+                    )
+                    continue
+                logger.error(
+                    "SuperOps GraphQL error variables=%s errors=%s",
+                    variables or {},
+                    graphql_errors,
+                )
+                return None
+            return response_data
 
-    except requests.exceptions.RequestException as err:
-        logger.error(f"Request failed: {err}")
-        return None
+        except requests.exceptions.RequestException as err:
+            status_code = getattr(getattr(err, "response", None), "status_code", None)
+            retryable = status_code == 429 or status_code is None or status_code >= 500
+            if retryable and attempt < max_attempts:
+                logger.warning(
+                    "Transient SuperOps request failure; retrying attempt=%s/%s status=%s variables=%s error=%s",
+                    attempt + 1,
+                    max_attempts,
+                    status_code,
+                    variables or {},
+                    err,
+                )
+                continue
+            logger.error("SuperOps request failed variables=%s error=%s", variables or {}, err)
+            return None
+        except ValueError as err:
+            logger.error("SuperOps returned invalid JSON variables=%s error=%s", variables or {}, err)
+            return None
+
+    return None
 
 # Function to strip HTML content
 def strip_html(content):
@@ -449,11 +485,24 @@ def get_ticket_notes(ticket_id):
     return notes
 
 # Fetch all tickets for a client
-def get_tickets_for_client(account_id, remaining_ticket_cap=None):
+def get_tickets_for_client(
+    account_id,
+    remaining_ticket_cap=None,
+    pagination_stats=None,
+    client_name=None,
+    ticket_callback=None,
+    progress_state=None,
+):
     """Fetches all tickets for a given client using `condition` filter."""
     tickets = []
     page = 1
-    page_size = 10
+    page_size = 100
+    pages_fetched = 0
+    raw_tickets_fetched = 0
+    tickets_read = 0
+    selected_tickets = 0
+    expected_total = None
+    seen_ticket_ids = set()
     cutoff_datetime = get_superops_created_datetime_cutoff(SUPEROPS_TICKETS_CREATED_WITHIN_DAYS)
     cutoff_time = (
         cutoff_datetime.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -478,22 +527,109 @@ def get_tickets_for_client(account_id, remaining_ticket_cap=None):
                 "pageSize": page_size,
                 "condition": {
                     "joinOperator": "AND",
-                    "operands": [{"attribute": "client.accountId", "operator": "contains", "value": account_id}]
-                }
+                    "operands": [{"attribute": "client.accountId", "operator": "is", "value": account_id}]
+                },
+                "sort": [{"attribute": "ticketId", "order": "ASC"}],
             }
         }
 
         response = make_api_call(QUERY_GET_TICKETS, variables)
 
         if response is None or "data" not in response or response["data"].get("getTicketList") is None:
-            return []
+            logger.error("Failed to retrieve ticket page client=%s page=%s; stopping pagination.", account_id, page)
+            break
 
         ticket_data = response["data"]["getTicketList"]
         if "tickets" not in ticket_data:
-            return []
+            logger.error("Ticket response missing tickets list for client=%s page=%s", account_id, page)
+            break
 
-        logger.info(f"Tickets for client {account_id}: {len(ticket_data['tickets'])}")
-        for ticket in ticket_data["tickets"]:
+        page_tickets = ticket_data["tickets"]
+        if not isinstance(page_tickets, list):
+            logger.error(
+                "Ticket response has invalid tickets list for client=%s page=%s value_type=%s",
+                account_id,
+                page,
+                type(page_tickets).__name__,
+            )
+            break
+        pages_fetched += 1
+        raw_tickets_fetched += len(page_tickets)
+        list_info = ticket_data.get("listInfo")
+        if not isinstance(list_info, dict):
+            logger.error(
+                "Ticket response missing listInfo; stopping pagination for client=%s page=%s fetched=%s",
+                account_id,
+                page,
+                raw_tickets_fetched,
+            )
+            break
+        response_page = list_info.get("page")
+        if response_page is not None and response_page != page:
+            logger.error(
+                "Ticket response page mismatch for client=%s requested=%s returned=%s; stopping pagination.",
+                account_id,
+                page,
+                response_page,
+            )
+            break
+        expected_total = list_info.get("totalCount", expected_total)
+        has_more = list_info.get("hasMore")
+        if not isinstance(has_more, bool):
+            logger.error(
+                "Ticket response has invalid hasMore for client=%s page=%s value=%r; stopping pagination.",
+                account_id,
+                page,
+                has_more,
+            )
+            break
+        try:
+            expected_total = int(expected_total) if expected_total is not None else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ticket response has invalid totalCount for client=%s page=%s value=%r",
+                account_id,
+                page,
+                expected_total,
+            )
+            expected_total = None
+        if progress_state is not None:
+            progress_state["total"] = expected_total
+        logger.info(
+            "[SuperOps | %s | page %s] Found %s tickets (%s of %s; more pages: %s).",
+            client_name or account_id,
+            page,
+            len(page_tickets),
+            raw_tickets_fetched,
+            expected_total if expected_total is not None else "unknown",
+            "yes" if has_more else "no",
+        )
+
+        if has_more is True and not page_tickets:
+            logger.error("Ticket pagination made no progress for client=%s page=%s", account_id, page)
+            break
+
+        for ticket in page_tickets:
+            tickets_read += 1
+            if tickets_read % 10 == 0:
+                logger.info(
+                    "[SuperOps] Reading tickets for %s: %s read%s.",
+                    client_name or account_id,
+                    tickets_read,
+                    f" of {expected_total}" if expected_total is not None else "",
+                )
+            ticket_id = ticket.get("ticketId")
+            if ticket_id in seen_ticket_ids:
+                logger.warning(
+                    "Duplicate ticket returned across pages; skipping client=%s ticket_id=%s page=%s",
+                    account_id,
+                    ticket_id,
+                    page,
+                )
+                continue
+            if ticket_id:
+                seen_ticket_ids.add(ticket_id)
+
             if not ticket_is_within_created_window(ticket, cutoff_datetime):
                 logger.info(
                     "Skipping ticket %s for client %s because createdTime=%s is older than cutoff=%s",
@@ -504,12 +640,17 @@ def get_tickets_for_client(account_id, remaining_ticket_cap=None):
                 )
                 continue
 
-            if remaining_ticket_cap is not None and len(tickets) >= remaining_ticket_cap:
+            if remaining_ticket_cap is not None and selected_tickets >= remaining_ticket_cap:
                 logger.info(
                     "Reached remaining ticket cap for client %s at %s tickets.",
                     account_id,
                     remaining_ticket_cap,
                 )
+                if pagination_stats is not None:
+                    pagination_stats["pages"] = pages_fetched
+                    pagination_stats["raw_tickets"] = raw_tickets_fetched
+                    pagination_stats["selected"] = selected_tickets
+                    pagination_stats["api_total"] = expected_total
                 return tickets
 
             ticket_id = ticket.get("ticketId")
@@ -519,12 +660,30 @@ def get_tickets_for_client(account_id, remaining_ticket_cap=None):
             ticket["conversations"] = get_ticket_conversations(ticket_id)
             ticket["notes"] = get_ticket_notes(ticket_id)  
 
-            tickets.append(ticket)
+            if ticket_callback is not None:
+                ticket_callback(ticket)
+            else:
+                tickets.append(ticket)
+            selected_tickets += 1
 
-        if not ticket_data.get("listInfo", {}).get("hasMore", False):
+        if has_more is not True:
             break
 
         page += 1  
+
+    if expected_total is not None and raw_tickets_fetched < expected_total and remaining_ticket_cap is None:
+        logger.warning(
+            "Ticket pagination ended before API total for client=%s fetched=%s api_total=%s pages=%s",
+            account_id,
+            raw_tickets_fetched,
+            expected_total,
+            pages_fetched,
+        )
+    if pagination_stats is not None:
+        pagination_stats["pages"] = pages_fetched
+        pagination_stats["raw_tickets"] = raw_tickets_fetched
+        pagination_stats["selected"] = selected_tickets
+        pagination_stats["api_total"] = expected_total
 
     return tickets
 
@@ -920,21 +1079,26 @@ def log_import_summary(results):
     for result in results:
         summary[result["result"]] = summary.get(result["result"], 0) + 1
 
+    failure_count = sum(
+        summary.get(result_name, 0)
+        for result_name in (
+            "skipped_missing_required_fields",
+            "failed_date_conversion",
+            "failed_payload_prepare",
+            "failed_ticket_create",
+            "failed_ticket_processing",
+            "failed_customer_processing",
+        )
+    )
     logger.info(
-        "import_summary total=%s would_create=%s created=%s skipped_duplicate=%s skipped_missing_customer=%s "
-        "skipped_missing_required_fields=%s failed_date_conversion=%s failed_payload_prepare=%s "
-        "failed_ticket_create=%s failed_ticket_processing=%s failed_customer_processing=%s created_with_comment_failures=%s",
+        "[Summary] Import results: %s processed; %s would be created; %s created; "
+        "%s duplicates skipped; %s missing customers; %s failures; %s created with comment failures.",
         len(results),
         summary.get("would_create", 0),
         summary.get("created", 0),
         summary.get("skipped_duplicate", 0),
         summary.get("skipped_missing_customer", 0),
-        summary.get("skipped_missing_required_fields", 0),
-        summary.get("failed_date_conversion", 0),
-        summary.get("failed_payload_prepare", 0),
-        summary.get("failed_ticket_create", 0),
-        summary.get("failed_ticket_processing", 0),
-        summary.get("failed_customer_processing", 0),
+        failure_count,
         summary.get("created_with_comment_failures", 0),
     )
 
@@ -970,7 +1134,15 @@ def process_customer_tickets(client, tickets):
         matched_ticket_ids = compare_tickets_by_subject(tickets, syncro_tickets_subjects_dates)
         logger.info(f"Matched Ticket Ids: {matched_ticket_ids}")
 
-        for ticket_id, ticket_info in tickets.items():
+        total_tickets = len(tickets)
+        for ticket_number, (ticket_id, ticket_info) in enumerate(tickets.items(), start=1):
+            if ticket_number % 10 == 0 or ticket_number == total_tickets:
+                logger.info(
+                    "[Syncro] Processing ticket %s of %s for client %s (checking duplicates and writing).",
+                    ticket_number,
+                    total_tickets,
+                    client,
+                )
             try:
                 ticket_results.append(
                     process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
@@ -993,6 +1165,23 @@ def process_customer_tickets(client, tickets):
                 )
                 log_ticket_result(result)
                 ticket_results.append(result)
+
+            if ticket_number % 10 == 0 or ticket_number == total_tickets:
+                created_count = sum(
+                    item["result"] in ("created", "created_with_comment_failures")
+                    for item in ticket_results
+                )
+                skipped_count = sum(item["result"].startswith("skipped_") for item in ticket_results)
+                failed_count = sum(item["result"].startswith("failed_") for item in ticket_results)
+                logger.info(
+                    "[Progress] Completed %s of %s for %s in Syncro: %s created, %s skipped, %s failed.",
+                    ticket_number,
+                    total_tickets,
+                    client,
+                    created_count,
+                    skipped_count,
+                    failed_count,
+                )
 
     except Exception as e:
         logger.error(f"Error processing customer {client}: {e}", exc_info=True)
@@ -1182,7 +1371,7 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
 
     created_ticket_id = created_ticket_response["ticket"].get("id")
     created_ticket_number = created_ticket_response["ticket"].get("number")
-    logger.info(f"Successfully created Syncro Ticket: {created_ticket_number} (ID: {created_ticket_id})")
+    logger.info("Ticket created successfully.")
 
     if pauser_on:
         input("Pausing for Ticket Creation - Press Enter to continue...")
@@ -1233,56 +1422,262 @@ def process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids
     return result
 
 
+def prepare_syncro_client_context(client):
+    """Load the Syncro customer and existing ticket subjects before streaming imports."""
+    syncro_customer_id = get_customer_id_by_name(client)
+    if not syncro_customer_id:
+        logger.warning("Customer '%s' not found in Syncro. Tickets will be marked as skipped.", client)
+        return None
+
+    syncro_tickets = get_all_tickets_for_customer(client, customer_id=syncro_customer_id)
+    return extract_ticket_subjects_and_dates(syncro_tickets)
+
+
+def process_streamed_ticket(client, raw_ticket, syncro_ticket_subjects_dates, run_results):
+    """Normalize and process one SuperOps ticket immediately after it is read."""
+    ticket_id = raw_ticket.get("ticketId")
+    display_id = raw_ticket.get("displayId")
+
+    try:
+        ticket_info = normalize_superops_ticket(raw_ticket)
+        if syncro_ticket_subjects_dates is None:
+            result = build_ticket_result(
+                client,
+                ticket_id,
+                display_id,
+                "skipped_missing_customer",
+                reason="customer_not_found_in_syncro",
+            )
+        else:
+            matched_ticket_ids = [
+                display_id
+            ] if display_id and any(
+                str(display_id) in str(existing.get("subject", ""))
+                for existing in syncro_ticket_subjects_dates
+            ) else []
+            result = process_individual_ticket(client, ticket_id, ticket_info, matched_ticket_ids)
+        run_results.append(result)
+        return result
+    except Exception as ticket_error:
+        logger.error(
+            "Error processing streamed ticket customer=%s ticket_id=%s display_id=%s: %s",
+            client,
+            ticket_id,
+            display_id,
+            ticket_error,
+            exc_info=True,
+        )
+        result = build_ticket_result(
+            client,
+            ticket_id,
+            display_id,
+            "failed_ticket_processing",
+            reason=str(ticket_error),
+        )
+        log_ticket_result(result)
+        run_results.append(result)
+        return result
+
+
 def process_all_clients():
     """Fetch clients and process their tickets one customer at a time."""
     run_results = []
     remaining_ticket_cap = MAX_TICKETS_TO_IMPORT
+    clients_seen = 0
+    client_pages = 0
+    tickets_fetched = 0
+    tickets_selected = 0
+    seen_client_ids = set()
     logger.info(
-        "Starting import run mode=%s max_tickets_to_import=%s",
-        "dry_run" if DRY_RUN else "write",
-        remaining_ticket_cap,
+        "[Summary] Import started: mode=%s; ticket limit=%s; date filter=%s.",
+        "dry run" if DRY_RUN else "write",
+        remaining_ticket_cap if remaining_ticket_cap is not None else "unlimited",
+        f"last {SUPEROPS_TICKETS_CREATED_WITHIN_DAYS} days"
+        if SUPEROPS_TICKETS_CREATED_WITHIN_DAYS is not None
+        else "all dates",
     )
-    clients_response = make_api_call(
-        QUERY_GET_CLIENT_LIST, {"input": {"page": 1, "pageSize": 100}}
-    )
+    client_page = 1
+    client_page_size = 100
+    while True:
+        clients_response = make_api_call(
+            QUERY_GET_CLIENT_LIST,
+            {
+                "input": {
+                    "page": client_page,
+                    "pageSize": client_page_size,
+                    "sort": [{"attribute": "accountId", "order": "ASC"}],
+                }
+            },
+        )
 
-    if (
-        clients_response is None
-        or "data" not in clients_response
-        or clients_response["data"].get("getClientList") is None
-    ):
-        logger.error("Failed to retrieve client list from SuperOps.")
-        return run_results
-
-    for client in clients_response["data"]["getClientList"]["clients"]:
-        if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
-            logger.info("Global ticket cap reached. Stopping before client %s.", client["name"])
+        if (
+            clients_response is None
+            or "data" not in clients_response
+            or clients_response["data"].get("getClientList") is None
+        ):
+            logger.error("Failed to retrieve client list page=%s; stopping client pagination.", client_page)
             break
 
-        account_id = client["accountId"]
-        client_name = client["name"]
+        client_data = clients_response["data"]["getClientList"]
+        clients = client_data.get("clients")
+        list_info = client_data.get("listInfo")
+        if not isinstance(clients, list) or not isinstance(list_info, dict):
+            logger.error("Client response missing clients/listInfo page=%s; stopping client pagination.", client_page)
+            break
 
-        tickets = get_tickets_for_client(account_id, remaining_ticket_cap=remaining_ticket_cap)
-        logger.info(f"Tickets found for {client_name}: {len(tickets)}")
+        client_pages += 1
+        clients_seen += len(clients)
+        has_more = list_info.get("hasMore")
+        response_page = list_info.get("page")
+        if response_page is not None and response_page != client_page:
+            logger.error(
+                "Client response page mismatch requested=%s returned=%s; stopping pagination.",
+                client_page,
+                response_page,
+            )
+            break
+        if not isinstance(has_more, bool):
+            logger.error(
+                "Client response has invalid hasMore page=%s value=%r; stopping pagination.",
+                client_page,
+                has_more,
+            )
+            break
+        logger.info(
+            "[SuperOps | clients | page %s] Found %s clients (%s total so far; API total: %s; more pages: %s).",
+            client_page,
+            len(clients),
+            clients_seen,
+            list_info.get("totalCount", "unknown"),
+            "yes" if has_more else "no",
+        )
 
-        client_ticket_info = {}
-        for ticket in tickets:
-            ticket_id = ticket.get("ticketId")
-            if ticket_id:
-                client_ticket_info[ticket_id] = normalize_superops_ticket(ticket)
+        if has_more is True and not clients:
+            logger.error("Client pagination made no progress page=%s; stopping.", client_page)
+            break
 
-        run_results.extend(process_customer_tickets(client_name, client_ticket_info))
-        if remaining_ticket_cap is not None:
-            remaining_ticket_cap -= len(client_ticket_info)
+        for client in clients:
+            if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
+                logger.info("Global ticket cap reached. Stopping before client %s.", client.get("name"))
+                break
+
+            account_id = client.get("accountId")
+            client_name = client.get("name", "Unknown")
+            if not account_id:
+                logger.warning("Skipping client without accountId name=%s", client_name)
+                continue
+            if account_id in seen_client_ids:
+                logger.warning(
+                    "Duplicate client returned across pages; skipping account_id=%s name=%s page=%s",
+                    account_id,
+                    client_name,
+                    client_page,
+                )
+                continue
+            seen_client_ids.add(account_id)
+
             logger.info(
-                "Remaining global ticket cap after client %s: %s",
+                "[Progress] Preparing Syncro and starting ticket import for %s.",
                 client_name,
-                remaining_ticket_cap,
+            )
+            syncro_ticket_subjects_dates = prepare_syncro_client_context(client_name)
+            ticket_stats = {}
+            client_progress = {"processed": 0, "total": None}
+            client_results = []
+
+            def log_stream_progress(force=False):
+                if not client_progress["processed"]:
+                    return
+                if not force and client_progress["processed"] % 10 != 0:
+                    return
+                created_count = sum(
+                    item["result"] in ("created", "created_with_comment_failures")
+                    for item in client_results
+                )
+                skipped_count = sum(item["result"].startswith("skipped_") for item in client_results)
+                failed_count = sum(item["result"].startswith("failed_") for item in client_results)
+                logger.info(
+                    "[Progress] Completed %s of %s for %s in Syncro: %s created, %s skipped, %s failed.",
+                    client_progress["processed"],
+                    client_progress["total"] or "unknown",
+                    client_name,
+                    created_count,
+                    skipped_count,
+                    failed_count,
+                )
+
+            def handle_streamed_ticket(ticket):
+                result = process_streamed_ticket(
+                    client_name,
+                    ticket,
+                    syncro_ticket_subjects_dates,
+                    run_results,
+                )
+                client_progress["processed"] += 1
+                client_results.append(result)
+                log_stream_progress()
+
+            tickets = get_tickets_for_client(
+                account_id,
+                remaining_ticket_cap=remaining_ticket_cap,
+                pagination_stats=ticket_stats,
+                client_name=client_name,
+                ticket_callback=handle_streamed_ticket,
+                progress_state=client_progress,
+            )
+            log_stream_progress(force=True)
+            tickets_fetched += ticket_stats.get("raw_tickets", 0)
+            tickets_selected += ticket_stats.get("selected", len(tickets))
+            logger.info(
+                "[SuperOps | client %s] Found %s tickets across %s page(s); %s selected for import (API total: %s).",
+                client_name,
+                ticket_stats.get("raw_tickets", 0),
+                ticket_stats.get("pages", 0),
+                ticket_stats.get("selected", len(tickets)),
+                ticket_stats.get("api_total"),
             )
 
+            if remaining_ticket_cap is not None:
+                remaining_ticket_cap -= ticket_stats.get("selected", len(tickets))
+                logger.info(
+                    "Remaining global ticket cap after client %s: %s",
+                    client_name,
+                    remaining_ticket_cap,
+                )
+            logger.info(
+                "[Progress] Run so far: %s client(s) processed; %s tickets fetched; %s selected; %s import result(s).",
+                len(seen_client_ids),
+                tickets_fetched,
+                tickets_selected,
+                len(run_results),
+            )
+
+        if remaining_ticket_cap is not None and remaining_ticket_cap <= 0:
+            break
+        if has_more is not True:
+            break
+        client_page += 1
+
+    logger.info(
+        "[Summary] Run totals: %s client(s) across %s page(s); %s tickets fetched; %s selected; "
+        "%s processed; remaining ticket limit: %s.",
+        clients_seen,
+        client_pages,
+        tickets_fetched,
+        tickets_selected,
+        len(run_results),
+        remaining_ticket_cap,
+    )
     log_import_summary(run_results)
     return run_results
 
 # Main Execution
 if __name__ == "__main__":
-    process_all_clients()
+    try:
+        process_all_clients()
+    except KeyboardInterrupt:
+        logger.warning("[Summary] Import interrupted before the final totals were available.")
+        raise
+    except Exception:
+        logger.exception("[Summary] Import failed before the final totals were available.")
+        raise

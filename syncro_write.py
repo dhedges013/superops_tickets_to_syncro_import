@@ -106,7 +106,7 @@ def syncro_create_ticket(ticket_data: dict) -> dict:
 
         # Handle the response
         if response and "error" not in response:
-            logger.info(f"Successfully created ticket: {response.get('ticket', {}).get('number', 'Unknown')}")
+            logger.info("Ticket created successfully.")
             return response
         else:
             logger.error(f"Failed to create ticket. Response: {response}")
@@ -185,7 +185,7 @@ def syncro_create_comment(comment_data: dict, created_ticket_id: int = None) -> 
 
         # Handle the response
         if response and "error" not in response:
-            logger.info(f"✅ Successfully created comment for ticket {ticket_id}.")
+            logger.info("Comment added successfully.")
             return response
         else:
             logger.error(f"❌ Failed to create comment. Response: {response}")

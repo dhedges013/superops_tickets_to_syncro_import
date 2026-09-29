@@ -75,6 +75,15 @@ def load_or_fetch_temp_data(logger: logging.Logger, force_refresh: bool = False)
         contacts = syncro_get_all_contacts()
         statuses = syncro_get_ticket_statuses()
 
+        logger.info(
+            "[Summary] Syncro reference data: %s techs; %s issue types; %s customers; %s contacts; %s statuses.",
+            len(techs),
+            len(issue_types),
+            len(customers),
+            len(contacts),
+            len(statuses) if statuses else 0,
+        )
+
         _temp_data_cache = {
             "techs": techs,
             "issue_types": issue_types,

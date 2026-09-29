@@ -1,5 +1,6 @@
 import os
 import logging
+import sys
 from datetime import datetime
 
 # syncro_configs.py
@@ -36,7 +37,9 @@ except ImportError:
 SYNCRO_API_BASE_URL = f"https://{SYNCRO_SUBDOMAIN}.syncromsp.com/api/v1"
 
 # Rate limiting configuration
-RATE_LIMIT_SECONDS = 0.5
+# SuperOps documents a maximum of 100 API requests per minute.  A 0.7 second
+# delay keeps this process below that limit even when request time is negligible.
+RATE_LIMIT_SECONDS = 0.7
 
 # Logging Configuration
 LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "logs"))
@@ -57,11 +60,27 @@ class RunContextFilter(logging.Filter):
         return True
 
 
+class ConsoleSummaryFilter(logging.Filter):
+    """Keep console output focused on progress, summaries, warnings, and errors."""
+
+    SUMMARY_PREFIXES = (
+        "[Summary]",
+        "[Progress]",
+        "[Clients",
+        "[Client ",
+        "[Syncro",
+        "[SuperOps",
+    )
+
+    def filter(self, record):
+        return record.getMessage().startswith(self.SUMMARY_PREFIXES)
+
+
 _logging_configured = False
 
 
 def configure_logging():
-    """Configure a single shared file logger for the current import run."""
+    """Configure the file logger and a filtered progress console for the current run."""
     global _logging_configured
     if _logging_configured:
         return
@@ -79,7 +98,13 @@ def configure_logging():
         )
     )
 
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(ConsoleSummaryFilter())
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+
     root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
     _logging_configured = True
 
 def get_logger(name):
